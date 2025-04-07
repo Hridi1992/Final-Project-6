@@ -2,7 +2,8 @@ import tensorflow as tf
 from tensorflow.keras import layers, Input, regularizers
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.layers import Flatten, Dense, Dropout, BatchNormalization, Rescaling
+from tensorflow.keras.layers import RandomRotation, RandomFlip, RandomZoom, RandomTranslation
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, AveragePooling2D, GlobalAveragePooling2D
 from tensorflow.keras.optimizers import Adam, SGD
 import matplotlib.pyplot as plt
@@ -34,17 +35,17 @@ EPOCHS = 20
 # Create data generators with augmentation for training
 def prepare_data():
     train_datagen = ImageDataGenerator(
-        rescale=1./255,
-        rotation_range=15, # Randomly rotates images by ±15 degrees
-        width_shift_range=0.15, # Randomly shifts images horizontally by 10% of the width
-        height_shift_range=0.15, # Randomly shifts images vertically by 10% of the height
-        horizontal_flip=True, # Flips images horizontally
-        zoom_range=0.2, # Randomly zooms in/out by up to 10%
-        fill_mode='constant',  # For better handling of empty areas
+        #rescale=1./255,
+        #rotation_range=15, # Randomly rotates images by ±15 degrees
+        #width_shift_range=0.15, # Randomly shifts images horizontally by 10% of the width
+        #height_shift_range=0.15, # Randomly shifts images vertically by 10% of the height
+        #horizontal_flip=True, # Flips images horizontally
+        #zoom_range=0.2, # Randomly zooms in/out by up to 10%
+        #fill_mode='constant',  # For better handling of empty areas
         validation_split=0.2  # Split train/val
     )
 
-    test_datagen = ImageDataGenerator(rescale = 1./255)
+    test_datagen = ImageDataGenerator()
 
     # Load images from directories
     train_generator = train_datagen.flow_from_directory(
@@ -78,17 +79,27 @@ def prepare_data():
     )
 
     # Verify class indices
-    print("\nTraining Class Indices:", train_generator.class_indices)
-    print("Test Class Indices:", test_generator.class_indices)
+    #print("\nTraining Class Indices:", train_generator.class_indices)
+    #print("Test Class Indices:", test_generator.class_indices)
 
     return train_generator, val_generator, test_generator
 
 # Build the model (Construct the CNN architecture)
 def build_model():
     model = Sequential([
+        # Augmentation layers
+        Rescaling(1. / 255, input_shape=(IMG_SIZE, IMG_SIZE, CHANNELS)),
+        RandomRotation(factor=0.1, fill_mode='constant', fill_value=0),  # 10° in radians (10/360)
+        RandomTranslation(height_factor=0.15, width_factor=0.15, fill_mode='constant', fill_value=0),
+        RandomFlip(mode='horizontal'),
+        RandomZoom(height_factor=(-0.05, 0.05),width_factor=(-0.05, 0.05),fill_mode='constant',fill_value=0),  # Fixed zoom range
+
         # Convolutional blocks
         # 1
-        layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), kernel_regularizer=regularizers.L2(0.001), padding='same',input_shape=(IMG_SIZE, IMG_SIZE, CHANNELS)),
+        layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), kernel_regularizer=regularizers.L2(0.001), padding='same'),
+        layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
+        layers.Activation('relu'),
+        layers.Conv2D(filters=64, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001),padding='same'),
         layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
         layers.Activation('relu'),
         layers.MaxPooling2D(2,2),
@@ -98,18 +109,27 @@ def build_model():
         layers.Conv2D(filters=64, kernel_size=(3,3), strides=(1,1), kernel_regularizer=regularizers.L2(0.001), padding='same'),
         layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
         layers.Activation('relu'),
-        layers.MaxPooling2D(2,2),
-        layers.Dropout(0.2),
-
-        # 3
-        layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), kernel_regularizer=regularizers.L2(0.001), padding='same'),
+        layers.Conv2D(filters=64, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001),padding='same'),
         layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
         layers.Activation('relu'),
         layers.MaxPooling2D(2,2),
         layers.Dropout(0.3),
 
+        # 3
+        layers.Conv2D(filters=128, kernel_size=(3,3), strides=(1,1), kernel_regularizer=regularizers.L2(0.001), padding='same'),
+        layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
+        layers.Activation('relu'),
+        layers.Conv2D(filters=128, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001),padding='same'),
+        layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
+        layers.Activation('relu'),
+        layers.MaxPooling2D(2,2),
+        layers.Dropout(0.5),
+
         # 4
         layers.Conv2D(filters=256, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001), padding='same'),
+        layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
+        layers.Activation('relu'),
+        layers.Conv2D(filters=256, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001),padding='same'),
         layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001),
         layers.Activation('relu'),
         layers.Dropout(0.5),
