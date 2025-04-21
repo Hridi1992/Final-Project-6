@@ -3,7 +3,21 @@ from tensorflow.keras.applications import ResNet50
 from tensorflow.keras.applications.resnet50 import preprocess_input
 from tensorflow.keras import layers, models, regularizers
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from sklearn.metrics import f1_score
+import numpy as np
+from collections import defaultdict
+import os
+from tensorflow.keras.saving import register_keras_serializable
+from sklearn.metrics import (
+    f1_score,
+    classification_report,
+    cohen_kappa_score,
+    log_loss,
+    precision_score,
+    top_k_accuracy_score,
+    roc_auc_score,
+    confusion_matrix,
+    balanced_accuracy_score  # Added here
+)
 
 # Define paths
 train_dir = r'C:\Users\User\Documents\OsuSpring2025\DeepLearning\FProject\.venv\train'  # Contains class subfolders
@@ -13,7 +27,25 @@ test_dir = r'C:\Users\User\Documents\OsuSpring2025\DeepLearning\FProject\.venv\t
 IMG_SIZE = 48  # Original FER2013 size
 TARGET_SIZE = 224  # ResNet50 input size
 BATCH_SIZE = 32
+# FER2013 class names (ensure this matches your label mapping)
 CLASS_NAMES = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+
+@register_keras_serializable()
+def resnet_preprocess(x):
+    return preprocess_input(x)
+
+def print_class_distribution(data_dir):
+    """Print number of images per class in a directory"""
+    CLASS_NAMES = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+
+    print("\n=== Class Distribution ===")
+    for class_name in CLASS_NAMES:
+        class_dir = os.path.join(data_dir, class_name)
+        if os.path.exists(class_dir):
+            num_images = len(os.listdir(class_dir))
+            print(f"{class_name.capitalize():<9}: {num_images} images")
+        else:
+            print(f"{class_name.capitalize():<9}: Directory not found")
 
 def create_data_generators():
     """Create and configure data generators for training, validation, and testing"""
@@ -33,7 +65,7 @@ def create_data_generators():
         target_size=(IMG_SIZE, IMG_SIZE),
         color_mode='grayscale',
         batch_size=BATCH_SIZE,
-        class_mode='sparse',
+        class_mode='categorical',
         classes=CLASS_NAMES,
         subset='training'
     )
@@ -43,7 +75,7 @@ def create_data_generators():
         target_size=(IMG_SIZE, IMG_SIZE),
         color_mode='grayscale',
         batch_size=BATCH_SIZE,
-        class_mode='sparse',
+        class_mode='categorical',
         classes=CLASS_NAMES,
         shuffle=False,
         subset='validation'
@@ -54,12 +86,75 @@ def create_data_generators():
         target_size=(IMG_SIZE, IMG_SIZE),
         color_mode='grayscale',
         batch_size=BATCH_SIZE,
-        class_mode='sparse',
+        class_mode='categorical',
         classes=CLASS_NAMES,
         shuffle=False
     )
 
     return train_generator, val_generator, test_generator
+
+
+def visualize_conv_kernels(model, layer_name, max_filters=32):
+    """
+    Visualizes the kernels of a Conv2D layer in the model.
+
+    Args:
+        model: Keras model
+        layer_name: Name of the Conv2D layer to visualize
+        max_filters: Maximum number of filters to display (None for all)
+    """
+    # Retrieve the layer by name
+    try:
+        layer = model.get_layer(layer_name)
+    except ValueError:
+        print(f"Layer '{layer_name}' not found in the model.")
+        return
+
+    # Check if it's a Conv2D layer
+    if not isinstance(layer, layers.Conv2D):
+        print(f"Layer '{layer_name}' is not a Conv2D layer.")
+        return
+
+    # Get the kernels (weights)
+    kernels = layer.get_weights()[0]
+
+    # Normalize to [0, 1] for visualization
+    kernels = (kernels - kernels.min()) / (kernels.max() - kernels.min())
+
+    # Get number of filters and channels
+    num_filters = kernels.shape[-1]
+    num_channels = kernels.shape[-2]  # Input channels
+
+    # Limit displayed filters
+    if max_filters is not None:
+        num_filters = min(num_filters, max_filters)
+
+    # Calculate grid dimensions
+    cols = 8
+    rows = int(np.ceil(num_filters / cols))
+
+    # Create figure
+    fig = plt.figure(figsize=(cols * 2, rows * 2))
+    plt.suptitle(f"Kernels from layer: {layer_name}", fontsize=16)
+
+    # Plot each kernel
+    for i in range(num_filters):
+        ax = fig.add_subplot(rows, cols, i + 1)
+
+        # Get kernel (height, width, input_channels)
+        kernel = kernels[:, :, :, i]
+
+        # For RGB kernels (3 input channels)
+        if kernel.shape[-1] == 3:
+            ax.imshow(kernel)
+        else:
+            # For grayscale/other channels (take mean)
+            ax.imshow(np.mean(kernel, axis=-1), cmap='gray')
+
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
 
 # 2. Build model with integrated preprocessing
 def build_resnet_model():
@@ -70,53 +165,60 @@ def build_resnet_model():
     x = layers.RandomFlip("horizontal")(inputs)
     x = layers.RandomRotation(0.15)(x)
     x = layers.RandomZoom(0.1)(x)
-    x = layers.RandomContrast(0.2)(x)
+    x = layers.RandomContrast(0.1)(x)
 
     # ResNet50 preprocessing
     x = layers.Resizing(TARGET_SIZE, TARGET_SIZE)(x)
     x = layers.Concatenate()([x, x, x])  # Grayscale to RGB
-    x = layers.Lambda(preprocess_input)(x)  # Official ResNet50 preprocessing
+    x = layers.Lambda(resnet_preprocess)(x)  # Official ResNet50 preprocessing
 
     # Base model
     base_model = ResNet50(
         weights='imagenet',
         include_top=False,
-        input_shape=(TARGET_SIZE, TARGET_SIZE, 3)
+        input_shape=(TARGET_SIZE, TARGET_SIZE, 3),
+        name = 'resnet50'
     )
     x = base_model(x)
 
-    # New: Additional Conv Layer
-    x = layers.Conv2D(512, (1, 1), activation='relu')(x)
+    print(f"Total layers in ResNet50: {len(base_model.layers)}")
 
     # Classifier
+    # New: Additional Conv Layer
+    x = layers.Conv2D(filters=512, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001), padding='same')(x)
+    x = layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001)(x)
+    x = layers.Activation('relu')(x)
+    x = layers.Dropout(0.5)(x)
+
     x = layers.GlobalAveragePooling2D()(x)
+
+    # New: Additional Dense Layer
+    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = layers.Dropout(0.5)(x)
+
     x = layers.Dense(256, activation='relu')(x)
     x = layers.Dropout(0.5)(x)
 
-    # New: Additional Dense Layer
-    x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.L2(0.01))(x)
-    x = layers.Dropout(0.3)(x)
+    x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.L2(0.001))(x)
+    x = layers.Dropout(0.5)(x)
 
     outputs = layers.Dense(7, activation='softmax')(x)
 
     return models.Model(inputs,outputs)
 
-
 # --------------------------------------------------
-# 4. Initial Training Phase (Frozen Base Model)
+# 3. Initial Training Phase (Frozen Base Model) and Fine-Tuning Phase (Partial Unfreezing)
 # --------------------------------------------------
-# --------------------------------------------------
-# 5. Fine-Tuning Phase (Partial Unfreezing)
-# --------------------------------------------------
-def train_model(model, train_gen, val_gen, initial_epochs=15, fine_tune_epochs=25):
+def train_model(model, train_gen, val_gen, initial_epochs=2, fine_tune_epochs=2):
     """Handle both initial training and fine-tuning phases"""
+
     # Initial training with frozen base
     print("\n=== Initial Training ===")
     model.get_layer("resnet50").trainable = False
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(1e-4),
-        loss='sparse_categorical_crossentropy',
+        loss='categorical_crossentropy',
         metrics=['accuracy']
     )
 
@@ -126,7 +228,7 @@ def train_model(model, train_gen, val_gen, initial_epochs=15, fine_tune_epochs=2
         validation_data=val_gen,
         callbacks=[
             tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-            tf.keras.callbacks.ModelCheckpoint('initial_best.h5', save_best_only=True)
+            tf.keras.callbacks.ModelCheckpoint('initial_best.keras', save_best_only=True)
         ]
     )
 
@@ -144,8 +246,9 @@ def train_model(model, train_gen, val_gen, initial_epochs=15, fine_tune_epochs=2
         layer.trainable = True
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-5),
-        loss='sparse_categorical_crossentropy',
+        optimizer=tf.keras.optimizers.Adam(learning_rate=tf.keras.optimizers.schedules.ExponentialDecay(
+            initial_learning_rate=1e-5, decay_steps=1000, decay_rate=0.9)),
+        loss='categorical_crossentropy',
         metrics=['accuracy']
     )
 
@@ -156,7 +259,7 @@ def train_model(model, train_gen, val_gen, initial_epochs=15, fine_tune_epochs=2
         validation_data=val_gen,
         callbacks=[
             tf.keras.callbacks.EarlyStopping(patience=3),
-            tf.keras.callbacks.ModelCheckpoint('best_model.h5', save_best_only=True)
+            tf.keras.callbacks.ModelCheckpoint('best_model.keras', save_best_only=True)
         ]
     )
 
@@ -165,6 +268,7 @@ def train_model(model, train_gen, val_gen, initial_epochs=15, fine_tune_epochs=2
 
 def evaluate_model(model, test_gen):
     """Evaluate model performance with accuracy, F1 score, and confusion matrix"""
+
     print("\n=== Final Evaluation ===")
 
     # Basic evaluation
@@ -179,6 +283,33 @@ def evaluate_model(model, test_gen):
     # F1 Score
     f1 = f1_score(y_true, y_pred, average='macro')
     print(f"F1 Macro Score: {f1:.2%}")
+
+    # Classification report
+    print(classification_report(y_true, y_pred, target_names=CLASS_NAMES, zero_division=0))
+
+    # Balanced accuracy
+    balanced_acc = balanced_accuracy_score(y_true, y_pred)
+    print(f"Balanced accuracy Score: {balanced_acc:.2%}")
+
+    # Cohen's Kappa
+    kappa = cohen_kappa_score(y_true, y_pred)
+    print(f"Cohen Kappa Score: {kappa:.2%}")
+
+    # ROC AUC (Macro/Micro)
+    roc_auc = roc_auc_score(y_true, y_pred_probs, multi_class='ovr', average='macro')
+    print(f"ROC AUC Score: {roc_auc:.2%}")
+
+    # Top-k accuracy
+    top2_acc = top_k_accuracy_score(y_true, y_pred_probs, k=2)
+    print(f"Top-k Score: {top2_acc:.2%}")
+
+    # Class-specific metrics
+    disgust_precision = precision_score(y_true, y_pred, labels=[1], average='micro', zero_division=0)
+    print(f"Class-specific metrics Score: {disgust_precision:.2%}")
+
+    # Log Loss (Cross-Entropy Loss)
+    loss = log_loss(y_true, y_pred_probs)
+    print(f"Log-loss Score: {loss:.2%}")
 
     # Confusion Matrix
     cm = confusion_matrix(y_true, y_pred)
@@ -204,11 +335,18 @@ def main():
     train_gen, val_gen, test_gen = create_data_generators()
     model = build_resnet_model()
 
+    print("\n=== Training dataset ===")
+    print_class_distribution(train_dir)
+    print("\n=== Testing dataset ===")
+    print_class_distribution(test_dir)
+
     # Training pipeline
     trained_model = train_model(model, train_gen, val_gen)
 
     # Load best model and evaluate
-    best_model = models.load_model('best_model.h5')
+    best_model = models.load_model('best_model.keras',custom_objects={'resnet_preprocess': resnet_preprocess})
+
+    visualize_conv_kernels(model, 'resnet50/conv1_conv', max_filters=32)
     evaluate_model(best_model, test_gen)
 
 
