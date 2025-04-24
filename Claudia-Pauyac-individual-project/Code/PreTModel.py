@@ -6,6 +6,8 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 import numpy as np
 from collections import defaultdict
 import os
+import matplotlib.pyplot as plt
+import seaborn as sns
 from tensorflow.keras.saving import register_keras_serializable
 from sklearn.metrics import (
     f1_score,
@@ -30,9 +32,11 @@ BATCH_SIZE = 32
 # FER2013 class names (ensure this matches your label mapping)
 CLASS_NAMES = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
 
+
 @register_keras_serializable()
 def resnet_preprocess(x):
     return preprocess_input(x)
+
 
 def print_class_distribution(data_dir):
     """Print number of images per class in a directory"""
@@ -47,10 +51,11 @@ def print_class_distribution(data_dir):
         else:
             print(f"{class_name.capitalize():<9}: Directory not found")
 
+
 def create_data_generators():
     """Create and configure data generators for training, validation, and testing"""
     train_datagen = ImageDataGenerator(
-        rescale=1./255,
+        rescale=1. / 255,
         rotation_range=15,
         width_shift_range=0.2,
         height_shift_range=0.2,
@@ -58,7 +63,7 @@ def create_data_generators():
         validation_split=0.2
     )
 
-    test_datagen = ImageDataGenerator(rescale=1./255)
+    test_datagen = ImageDataGenerator(rescale=1. / 255)
 
     train_generator = train_datagen.flow_from_directory(
         train_dir,
@@ -94,7 +99,7 @@ def create_data_generators():
     return train_generator, val_generator, test_generator
 
 
-def visualize_conv_kernels(model, layer_name, max_filters=32):
+def visualize_conv_kernels(model, layer_name, layer_index, max_filters=32):
     """
     Visualizes the kernels of a Conv2D layer in the model.
 
@@ -103,58 +108,86 @@ def visualize_conv_kernels(model, layer_name, max_filters=32):
         layer_name: Name of the Conv2D layer to visualize
         max_filters: Maximum number of filters to display (None for all)
     """
-    # Retrieve the layer by name
-    try:
-        layer = model.get_layer(layer_name)
-    except ValueError:
-        print(f"Layer '{layer_name}' not found in the model.")
-        return
+    if (max_filters == -1):
+        """Visualize convolutional kernels from specified layer."""
+        conv_layers = [layer for layer in model.layers
+                       if 'Conv2D' in str(layer.__class__)]
 
-    # Check if it's a Conv2D layer
-    if not isinstance(layer, layers.Conv2D):
-        print(f"Layer '{layer_name}' is not a Conv2D layer.")
-        return
+        if not conv_layers:
+            raise ValueError("No convolutional layers found in the model")
 
-    # Get the kernels (weights)
-    kernels = layer.get_weights()[0]
+        layer = conv_layers[layer_index]
+        kernels, _ = layer.get_weights()
 
-    # Normalize to [0, 1] for visualization
-    kernels = (kernels - kernels.min()) / (kernels.max() - kernels.min())
+        # Normalize kernels for visualization
+        kernels = (kernels - kernels.min()) / (kernels.max() - kernels.min())
 
-    # Get number of filters and channels
-    num_filters = kernels.shape[-1]
-    num_channels = kernels.shape[-2]  # Input channels
+        # Plot configuration
+        n_filters = kernels.shape[-1]
+        n_cols = 8
+        n_rows = int(np.ceil(n_filters / n_cols))
 
-    # Limit displayed filters
-    if max_filters is not None:
-        num_filters = min(num_filters, max_filters)
+        plt.figure(figsize=(n_cols * 2, n_rows * 2))
+        for i in range(n_filters):
+            plt.subplot(n_rows, n_cols, i + 1)
+            plt.imshow(kernels[:, :, 0, i], cmap='viridis')
+            plt.axis('off')
+        plt.suptitle(f'Convolutional Kernels from Layer {layer_index}', y=0.95)
+        plt.show()
+    else:
+        # Retrieve the layer by name
+        try:
+            layer = model.get_layer(layer_name)
+        except ValueError:
+            print(f"Layer '{layer_name}' not found in the model.")
+            return
 
-    # Calculate grid dimensions
-    cols = 8
-    rows = int(np.ceil(num_filters / cols))
+        # Check if it's a Conv2D layer
+        if not isinstance(layer, layers.Conv2D):
+            print(f"Layer '{layer_name}' is not a Conv2D layer.")
+            return
 
-    # Create figure
-    fig = plt.figure(figsize=(cols * 2, rows * 2))
-    plt.suptitle(f"Kernels from layer: {layer_name}", fontsize=16)
+        # Get the kernels (weights)
+        kernels = layer.get_weights()[0]
 
-    # Plot each kernel
-    for i in range(num_filters):
-        ax = fig.add_subplot(rows, cols, i + 1)
+        # Normalize to [0, 1] for visualization
+        kernels = (kernels - kernels.min()) / (kernels.max() - kernels.min())
 
-        # Get kernel (height, width, input_channels)
-        kernel = kernels[:, :, :, i]
+        # Get number of filters and channels
+        num_filters = kernels.shape[-1]
+        num_channels = kernels.shape[-2]  # Input channels
 
-        # For RGB kernels (3 input channels)
-        if kernel.shape[-1] == 3:
-            ax.imshow(kernel)
-        else:
-            # For grayscale/other channels (take mean)
-            ax.imshow(np.mean(kernel, axis=-1), cmap='gray')
+        # Limit displayed filters
+        if max_filters is not None:
+            num_filters = min(num_filters, max_filters)
 
-        ax.axis('off')
+        # Calculate grid dimensions
+        cols = 8
+        rows = int(np.ceil(num_filters / cols))
 
-    plt.tight_layout()
-    plt.show()
+        # Create figure
+        fig = plt.figure(figsize=(cols * 2, rows * 2))
+        plt.suptitle(f"Kernels from layer: {layer_name}", fontsize=16)
+
+        # Plot each kernel
+        for i in range(num_filters):
+            ax = fig.add_subplot(rows, cols, i + 1)
+
+            # Get kernel (height, width, input_channels)
+            kernel = kernels[:, :, :, i]
+
+            # For RGB kernels (3 input channels)
+            if kernel.shape[-1] == 3:
+                ax.imshow(kernel)
+            else:
+                # For grayscale/other channels (take mean)
+                ax.imshow(np.mean(kernel, axis=-1), cmap='gray')
+
+            ax.axis('off')
+
+        plt.tight_layout()
+        plt.show()
+
 
 # 2. Build model with integrated preprocessing
 def build_resnet_model():
@@ -177,7 +210,7 @@ def build_resnet_model():
         weights='imagenet',
         include_top=False,
         input_shape=(TARGET_SIZE, TARGET_SIZE, 3),
-        name = 'resnet50'
+        name='resnet50'
     )
     x = base_model(x)
 
@@ -185,7 +218,8 @@ def build_resnet_model():
 
     # Classifier
     # New: Additional Conv Layer
-    x = layers.Conv2D(filters=512, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001), padding='same')(x)
+    x = layers.Conv2D(filters=512, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001),
+                      padding='same')(x)
     x = layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001)(x)
     x = layers.Activation('relu')(x)
     x = layers.Dropout(0.5)(x)
@@ -204,12 +238,13 @@ def build_resnet_model():
 
     outputs = layers.Dense(7, activation='softmax')(x)
 
-    return models.Model(inputs,outputs)
+    return models.Model(inputs, outputs)
+
 
 # --------------------------------------------------
 # 3. Initial Training Phase (Frozen Base Model) and Fine-Tuning Phase (Partial Unfreezing)
 # --------------------------------------------------
-def train_model(model, train_gen, val_gen, initial_epochs=2, fine_tune_epochs=2):
+def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1):
     """Handle both initial training and fine-tuning phases"""
 
     # Initial training with frozen base
@@ -268,6 +303,19 @@ def train_model(model, train_gen, val_gen, initial_epochs=2, fine_tune_epochs=2)
 
 def evaluate_model(model, test_gen):
     """Evaluate model performance with accuracy, F1 score, and confusion matrix"""
+    # Get all test data from generator
+    test_gen.reset()
+    y_true = []
+    y_pred = []
+    y_pred_probs = []
+    for _ in range(len(test_gen)):
+        x, y = next(test_gen)
+        y_true.extend(np.argmax(y, axis=1))
+        batch_pred_probs = model.predict(x, verbose=0)
+        y_pred_probs.extend(batch_pred_probs)
+    y_true = np.array(y_true)
+    y_pred_probs = np.vstack(y_pred_probs)
+    y_pred = np.argmax(y_pred_probs, axis=1)
 
     print("\n=== Final Evaluation ===")
 
@@ -276,9 +324,9 @@ def evaluate_model(model, test_gen):
     print(f"Test Accuracy: {test_acc:.2%}")
 
     # Generate predictions
-    y_pred_probs = model.predict(test_gen)
-    y_pred = np.argmax(y_pred_probs, axis=1)
-    y_true = test_gen.classes
+    # y_pred_probs = model.predict(test_gen)
+    # y_pred = np.argmax(y_pred_probs, axis=1)
+    # y_true = test_gen.classes
 
     # F1 Score
     f1 = f1_score(y_true, y_pred, average='macro')
@@ -312,11 +360,12 @@ def evaluate_model(model, test_gen):
     print(f"Log-loss Score: {loss:.2%}")
 
     # Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=range(len(CLASS_NAMES)))
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
 
     # Visualization
     plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+    sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
                 xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
     plt.title('Confusion Matrix')
     plt.xlabel('Predicted Label')
@@ -344,9 +393,17 @@ def main():
     trained_model = train_model(model, train_gen, val_gen)
 
     # Load best model and evaluate
-    best_model = models.load_model('best_model.keras',custom_objects={'resnet_preprocess': resnet_preprocess})
+    best_model = models.load_model('best_model.keras', custom_objects={'resnet_preprocess': resnet_preprocess})
 
-    visualize_conv_kernels(model, 'resnet50/conv1_conv', max_filters=32)
+    print("\n=== ResNet50 Layer Names ===")
+    # Get the ResNet50 base model from your architecture
+    base_model = best_model.get_layer("resnet50")
+    for layer in base_model.layers[:5]:  # First 5 layers
+        print(layer.name)
+
+    visualize_conv_kernels(base_model, 'conv1_conv', -1, max_filters=32)
+    visualize_conv_kernels(model, 'layer_name', layer_index=0, max_filters=-1)
+
     evaluate_model(best_model, test_gen)
 
 
