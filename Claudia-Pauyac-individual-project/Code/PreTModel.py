@@ -20,6 +20,7 @@ from sklearn.metrics import (
     confusion_matrix,
     balanced_accuracy_score  # Added here
 )
+from tensorflow.keras.layers import MultiHeadAttention, LayerNormalization
 
 # Define paths
 train_dir = r'C:\Users\User\Documents\OsuSpring2025\DeepLearning\FProject\.venv\train'  # Contains class subfolders
@@ -97,6 +98,27 @@ def create_data_generators():
     )
 
     return train_generator, val_generator, test_generator
+
+
+def transformer_block(x, num_heads=4, projection_dim=512, dropout_rate=0.1):
+    """Transformer encoder block for feature refinement."""
+    # Self-attention
+    attention_output = MultiHeadAttention(
+        num_heads=num_heads,
+        key_dim=projection_dim // num_heads,
+        dropout=dropout_rate
+    )(x, x)
+
+    # Skip connection 1
+    x = LayerNormalization(epsilon=1e-6)(x + attention_output)
+
+    # Feed-forward network
+    ffn = layers.Dense(projection_dim * 2, activation="gelu")(x)
+    ffn = layers.Dense(projection_dim)(ffn)
+    ffn = layers.Dropout(dropout_rate)(ffn)
+
+    # Skip connection 2
+    return LayerNormalization(epsilon=1e-6)(x + ffn)
 
 
 def visualize_conv_kernels(model, layer_name, layer_index, max_filters=32):
@@ -216,6 +238,40 @@ def build_resnet_model():
 
     print(f"Total layers in ResNet50: {len(base_model.layers)}")
 
+    # ========== HYBRID ARCHITECTURE CHANGES START HERE ==========
+    # 1. CNN Feature Processing
+    x = layers.Conv2D(512, (3, 3), padding='same', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation('relu')(x)
+    x = layers.Dropout(0.3)(x)
+
+    # 2. Prepare for Transformer
+    batch_size, height, width, channels = x.shape  # (None, 7, 7, 512)
+    x_reshape = layers.Reshape((height * width, channels))(x)  # (None, 49, 512)
+
+    # 3. Positional Embeddings
+    positions = tf.range(start=0, limit=height * width, delta=1)
+    position_embedding = layers.Embedding(
+        input_dim=height * width,
+        output_dim=channels
+    )(positions)  # (49, 512)
+    x_reshape = x_reshape + position_embedding  # Broadcast addition
+
+    # 4. Transformer Blocks
+    x_transformer = transformer_block(x_reshape, num_heads=8, projection_dim=512)
+    x_transformer = transformer_block(x_transformer, num_heads=8, projection_dim=512)
+
+    # 5. Combine CNN and Transformer Paths
+    # x_transformer = layers.GlobalAveragePooling1D()(x_transformer)  # (None, 512)
+    # x_cnn = layers.GlobalAveragePooling2D()(x)  # (None, 512)
+    # x = layers.concatenate([x_transformer, x_cnn])  # (None, 1024)
+
+    # 5. Reshape back to spatial dimensions
+    x_transformer = layers.Reshape((height, width, channels))(x_transformer)
+    # 6. Combine CNN and Transformer paths
+    x = layers.concatenate([x, x_transformer], axis=-1)  # (None, 7, 7, 1024)
+    # ========== HYBRID ARCHITECTURE CHANGES END HERE ==========
+
     # Classifier
     # New: Additional Conv Layer
     x = layers.Conv2D(filters=512, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001),
@@ -228,13 +284,13 @@ def build_resnet_model():
 
     # New: Additional Dense Layer
     x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
-    x = layers.Dropout(0.5)(x)
+    x = layers.Dropout(0.4)(x)
 
     x = layers.Dense(256, activation='relu')(x)
-    x = layers.Dropout(0.5)(x)
+    x = layers.Dropout(0.3)(x)
 
-    x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.L2(0.001))(x)
-    x = layers.Dropout(0.5)(x)
+    # x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.L2(0.001))(x)
+    # x = layers.Dropout(0.5)(x)
 
     outputs = layers.Dense(7, activation='softmax')(x)
 
@@ -293,12 +349,46 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
         initial_epoch=initial_history.epoch[-1] + 1,
         validation_data=val_gen,
         callbacks=[
-            tf.keras.callbacks.EarlyStopping(patience=3),
+            tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
             tf.keras.callbacks.ModelCheckpoint('best_model.keras', save_best_only=True)
         ]
     )
 
-    return model
+    return model, initial_history, fine_tune_history
+
+
+def plot_combined_history(initial_history, fine_tune_history):
+    """Plot combined training/validation accuracy and loss across both phases."""
+    # Combine metrics from both histories
+    acc = initial_history.history['accuracy'] + fine_tune_history.history['accuracy']
+    val_acc = initial_history.history['val_accuracy'] + fine_tune_history.history['val_accuracy']
+    loss = initial_history.history['loss'] + fine_tune_history.history['loss']
+    val_loss = initial_history.history['val_loss'] + fine_tune_history.history['val_loss']
+
+    epochs = range(1, len(acc) + 1)
+
+    plt.figure(figsize=(14, 5))
+
+    # Plot Accuracy
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, acc, 'b', label='Training Accuracy')
+    plt.plot(epochs, val_acc, 'r', label='Validation Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.xlabel('Epochs')
+    plt.ylabel('Accuracy')
+    plt.legend()
+
+    # Plot Loss
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, loss, 'b', label='Training Loss')
+    plt.plot(epochs, val_loss, 'r', label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
 
 
 def evaluate_model(model, test_gen):
@@ -376,7 +466,105 @@ def evaluate_model(model, test_gen):
     plt.savefig('confusion_matrix.png')  # Save to file
     plt.close()
 
-    return test_acc, f1
+    return test_acc, f1, cm_normalized
+
+
+# Plot the output feature maps from a specified convolutional layer.
+def plot_feature_maps(model, input_image, layer_index=0, rows=4, cols=8):
+    """Args:
+        model (keras.Model): Trained Keras model
+        input_image (np.array): Preprocessed input image (1 sample)
+        layer_index (int): Index of convolutional layer to visualize
+        rows (int): Number of rows in visualization grid
+        cols (int): Number of columns in visualization grid"""
+    # Get convolutional layers
+    conv_layers = [layer for layer in model.layers
+                   if isinstance(layer, layers.Conv2D)]
+
+    if not conv_layers:
+        raise ValueError("No convolutional layers found in the model")
+
+    if layer_index >= len(conv_layers):
+        raise ValueError(f"Layer index {layer_index} exceeds number of conv layers ({len(conv_layers)})")
+
+    # Create submodel that outputs feature maps from target layer
+    activation_model = tf.keras.Model(
+        inputs=model.input,  # Changed from model.inputs to model.input
+        outputs=conv_layers[layer_index].output
+    )
+
+    # Add batch dimension if needed
+    if len(input_image.shape) == 3:
+        input_image = np.expand_dims(input_image, axis=0)
+
+    # Get activations
+    activations = activation_model.predict(input_image, verbose=0)
+
+    # Plot configuration
+    n_filters = activations.shape[-1]
+    plt.figure(figsize=(cols * 2, rows * 2))
+
+    # Plot first 'rows*cols' feature maps
+    for i in range(min(rows * cols, n_filters)):
+        plt.subplot(rows, cols, i + 1)
+        plt.imshow(activations[0, :, :, i], cmap='viridis')
+        plt.axis('off')
+    plt.suptitle(f'Feature Maps from Layer {layer_index} ({conv_layers[layer_index].name})', y=0.92)
+    plt.show()
+
+
+def plot_resnet_feature_maps(model, input_image, layer_name=None, rows=4, cols=8):
+    """
+    Visualize feature maps from ResNet50's convolutional layers.
+    """
+    # 1. Get ResNet50 base model
+    resnet = model.get_layer("resnet50")
+
+    # 2. Get all convolutional layers from ResNet50
+    resnet_conv_layers = [layer for layer in resnet.layers
+                          if isinstance(layer, layers.Conv2D)]
+
+    if not resnet_conv_layers:
+        raise ValueError("No convolutional layers found in ResNet50")
+
+    # 3. Recreate preprocessing pipeline
+    processed_img = input_image
+    if len(processed_img.shape) == 3:
+        processed_img = np.expand_dims(processed_img, axis=0)
+
+    # Apply your model's preprocessing steps manually
+    processed_img = tf.image.resize(processed_img, [TARGET_SIZE, TARGET_SIZE])
+    processed_img = tf.repeat(processed_img, 3, axis=-1)  # Grayscale to RGB
+    processed_img = resnet_preprocess(processed_img)  # ResNet50 preprocessing
+
+    # 4. Create direct access to ResNet50
+    resnet_input = resnet.input
+    resnet_outputs = [layer.output for layer in resnet_conv_layers]
+
+    # 5. Create feature map model
+    feature_map_model = tf.keras.Model(
+        inputs=resnet.input,
+        outputs=resnet_outputs
+    )
+
+    # 6. Get all feature maps
+    feature_maps = feature_map_model.predict(processed_img)
+
+    # 7. Visualize each layer
+    for layer_name, fmaps in zip([l.name for l in resnet_conv_layers], feature_maps):
+        print(f"Visualizing layer: {layer_name}")
+
+        n_filters = fmaps.shape[-1]
+        plt.figure(figsize=(cols * 2, rows * 2))
+        plt.suptitle(f"Layer: {layer_name}\nFilters: {n_filters}", y=0.95)
+
+        for i in range(min(rows * cols, n_filters)):
+            plt.subplot(rows, cols, i + 1)
+            plt.imshow(fmaps[0, :, :, i], cmap='viridis')
+            plt.axis('off')
+
+        plt.tight_layout()
+        plt.show()
 
 
 def main():
@@ -390,7 +578,7 @@ def main():
     print_class_distribution(test_dir)
 
     # Training pipeline
-    trained_model = train_model(model, train_gen, val_gen)
+    trained_model, initial_history, fine_tune_history = train_model(model, train_gen, val_gen)
 
     # Load best model and evaluate
     best_model = models.load_model('best_model.keras', custom_objects={'resnet_preprocess': resnet_preprocess})
@@ -401,10 +589,26 @@ def main():
     for layer in base_model.layers[:5]:  # First 5 layers
         print(layer.name)
 
-    visualize_conv_kernels(base_model, 'conv1_conv', -1, max_filters=32)
+    visualize_conv_kernels(base_model, 'conv1_conv', -1, max_filters=128)
     visualize_conv_kernels(model, 'layer_name', layer_index=0, max_filters=-1)
 
-    evaluate_model(best_model, test_gen)
+    test_acc, f1, cm = evaluate_model(best_model, test_gen)
+
+    # Visualization
+    # plot_history(initial_history)
+    # plot_history(fine_tune_history)
+    plot_combined_history(initial_history, fine_tune_history)
+
+    # Get sample image for feature map visualization
+    test_gen.reset()
+    sample_images, _ = next(test_gen)
+    sample_image = sample_images[0]  # Get first image in batch
+
+    # Visualize all ResNet50 conv layers
+    plot_resnet_feature_maps(best_model, sample_image)
+    # Plot feature maps from different convolutional layers
+    plot_feature_maps(model, sample_image, layer_index=0)  # First conv layer
+    plot_feature_maps(model, sample_image, layer_index=1)  # First conv layer
 
 
 if __name__ == "__main__":
