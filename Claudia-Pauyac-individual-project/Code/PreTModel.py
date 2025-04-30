@@ -56,10 +56,14 @@ def create_data_generators():
     # Training data augmentation configuration
     train_datagen = ImageDataGenerator(
         rescale=1./255, # Normalize pixel values
-        rotation_range=15, # Random rotations ±15 degrees
+        rotation_range=25, # Random rotations ±15 degrees
         width_shift_range=0.2, # Horizontal shift ±20% of width
         height_shift_range=0.2, # Vertical shift ±20% of height
+        brightness_range=[0.8, 1.2],
+        shear_range=0.2,
+        zoom_range=0.2,
         horizontal_flip=True, # Random left-right flips
+        fill_mode='nearest',
         validation_split=0.2 # Holdout 20% for validation
     )
 
@@ -170,14 +174,14 @@ def build_resnet_model():
 
     # ========== DATA AUGMENTATION ==========
     # Real-time augmentation during training
-    x = layers.RandomFlip("horizontal")(inputs)
-    x = layers.RandomRotation(0.15)(x) # ±15% rotation
-    x = layers.RandomZoom(0.1)(x) # ±10% zoom
-    x = layers.RandomContrast(0.1)(x) # ±10% contrast variation
+    #x = layers.RandomFlip("horizontal")(inputs)
+    #x = layers.RandomRotation(0.15)(x) # ±15% rotation
+    #x = layers.RandomZoom(0.1)(x) # ±10% zoom
+    #x = layers.RandomContrast(0.1)(x) # ±10% contrast variation
 
     # ========== PREPROCESSING ==========
     # Resize to ResNet input size
-    x = layers.Resizing(TARGET_SIZE, TARGET_SIZE)(x)
+    x = layers.Resizing(TARGET_SIZE, TARGET_SIZE)(inputs)
     # Convert grayscale to RGB by repeating channels
     x = layers.Concatenate()([x, x, x])
     # Apply ResNet50 specific preprocessing
@@ -268,7 +272,7 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
         validation_data=val_gen,
         callbacks=[
             tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-            tf.keras.callbacks.ModelCheckpoint('initial_best.keras', save_best_only=True)
+            tf.keras.callbacks.ModelCheckpoint('initial_best_resnet.keras', save_best_only=True)
         ]
     )
 
@@ -552,12 +556,16 @@ def evaluate_model(model, test_gen):
     print("\n=== Final Evaluation ===")
 
     # Basic evaluation
-    test_loss, test_acc = model.evaluate(test_gen, verbose=0)
+    test_loss = log_loss(y_true, y_pred_probs)
+    test_acc = balanced_accuracy_score(y_true, y_pred)
 
     print(f"Test Accuracy: {test_acc:.2%}")
     print(f"Balanced Accuracy: {balanced_accuracy_score(y_true, y_pred):.2%}")
-    print(f"Macro F1: {f1_score(y_true, y_pred, average='macro'):.2%}")
-    print(classification_report(y_true, y_pred, target_names=CLASS_NAMES))
+    f1 = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    print(f"Macro F1: {f1:.2%}")
+    print(classification_report(y_true, y_pred,
+                               target_names=CLASS_NAMES,
+                               zero_division=0))
 
     # Cohen's Kappa
     kappa = cohen_kappa_score(y_true, y_pred)
@@ -617,7 +625,7 @@ def main():
         fine_tune_epochs=15)
 
     # Load best performing model
-    best_model = models.load_model('best_model.keras',custom_objects={'resnet_preprocess': resnet_preprocess})
+    best_model = models.load_model('best_model_resnet.keras',custom_objects={'resnet_preprocess': resnet_preprocess})
 
     # Get the ResNet50 base model from your architecture
     print("\n=== ResNet50 Layer Names ===")
