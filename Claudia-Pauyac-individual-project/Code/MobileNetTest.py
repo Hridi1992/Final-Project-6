@@ -481,7 +481,7 @@ def plot_resnet_feature_maps(model, input_image, layer_name=None, rows=4, cols=8
     # Apply your model's preprocessing steps manually
     processed_img = tf.image.resize(processed_img, [TARGET_SIZE, TARGET_SIZE])
     processed_img = tf.repeat(processed_img, 3, axis=-1)  # Grayscale to RGB
-    processed_img = resnet_preprocess(processed_img)  # ResNet50 preprocessing
+    processed_img = mobilenet_preprocess(processed_img)  # ResNet50 preprocessing
 
     # 4. Create direct access to ResNet50
     resnet_input = resnet.input
@@ -631,8 +631,8 @@ def main():
 
     # Training pipeline
     trained_model, initial_history, fine_tune_history = train_model(model, train_gen, val_gen,
-        initial_epochs=1,
-        fine_tune_epochs=1)
+        initial_epochs=15,
+        fine_tune_epochs=15)
 
     # Load best performing model
     best_model = models.load_model('best_model.keras',custom_objects={'resnet_preprocess': mobilenet_preprocess})
