@@ -637,7 +637,13 @@ def evaluate_model(model, test_gen):
 
     # Visualize recall distribution
     plt.figure(figsize=(10, 6))
-    sns.barplot(x=CLASS_NAMES, y=recall_per_class, palette="viridis")
+    sns.barplot(
+        x=CLASS_NAMES,
+        y=recall_per_class,
+        hue=CLASS_NAMES,  # Add hue mapping
+        palette="viridis",
+        legend=False  # Disable redundant legend
+    )
     plt.title("Per-Class Recall Scores")
     plt.ylim(0, 1)
     plt.xticks(rotation=45)
@@ -678,7 +684,11 @@ def evaluate_model(model, test_gen):
 
     # Confusion matrix visualization
     cm = confusion_matrix(y_true, y_pred, labels=range(len(CLASS_NAMES)))
-    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+    # Handle potential division by zero
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        cm_normalized = np.nan_to_num(cm_normalized, nan=0.0, posinf=0.0, neginf=0.0)
 
     plt.figure(figsize=(10, 8))
     sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='Blues',
@@ -692,7 +702,11 @@ def evaluate_model(model, test_gen):
     plt.savefig('confusion_matrix.png')  # Save to file
     plt.close()
 
-    return np.max(cm.diagonal())
+    # Get maximum valid class accuracy
+    max_acc = np.max(cm_normalized.diagonal())
+    max_acc = min(max_acc, 1.0)  # Ensure never exceeds 100%
+
+    return max_acc
 
 
 # ====================== MAIN EXECUTION ======================
