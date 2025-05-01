@@ -28,6 +28,7 @@ from sklearn.metrics import (
     balanced_accuracy_score
 )
 from sklearn.utils import class_weight
+from sklearn.metrics import recall_score
 from tensorflow.python.keras.models import save_model
 
 MODEL_PATH = os.path.abspath('best_model.keras')
@@ -69,9 +70,10 @@ def create_data_generators():
         width_shift_range=0.25, # Horizontal shift ±20% of width
         height_shift_range=0.25, # Vertical shift ±20% of height
         brightness_range=[0.6, 1.4],
-        shear_range=0.3,
-        zoom_range=0.3,
+        shear_range=0.4,
+        zoom_range=0.4,
         horizontal_flip=True, # Random left-right flips
+        channel_shift_range=50,
         fill_mode='constant',
         validation_split=0.2 # Holdout 20% for validation
     )
@@ -87,7 +89,9 @@ def create_data_generators():
         batch_size=BATCH_SIZE,
         class_mode='categorical', # One-hot encoded labels
         classes=CLASS_NAMES,
-        subset='training' # Training portion of split
+        subset='training',
+        interpolation='bicubic',
+        seed=42
     )
 
     # Validation data generator
@@ -219,22 +223,24 @@ def build_resnet_model():
         conv = layers.Conv2D(1, (7, 7), padding='same', activation='sigmoid')(concat)
         return layers.Multiply()([input_tensor, conv])
 
+    x = base_model(x)
     x = channel_attention(x)
-    x = base_model(x) # Pass through ResNet50
+     # Pass through ResNet50
 
     print(f"Total layers in ResNet50: {len(base_model.layers)}")
 
     # ========== HYBRID ARCHITECTURE ==========
     # 1. CNN Feature Enhancement
-    x = layers.Conv2D(512, (3, 3), activation='relu', padding='same')(x)
+    x = layers.Conv2D(1024, (3, 3), activation='swish', padding='same')(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Dropout(0.5)(x) # Reduce overfitting
+    x = layers.Dropout(0.6)(x) # Reduce overfitting
 
     # Global pooling and classification
     x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l1_l2(l1=1e-5, l2=1e-4))(x)
     x = layers.Dropout(0.5)(x)
-    outputs = layers.Dense(7, activation='softmax')(x)
+    outputs = layers.Dense(7, activation='softmax',
+                         kernel_initializer='lecun_normal')(x)
 
     model = models.Model(inputs, outputs)
     model.summary()
@@ -294,39 +300,59 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
     model.get_layer("resnet50").trainable = False
 
     # Class weight calculation
-    class_weights = class_weight.compute_class_weight(
-        'balanced',
-        classes=np.unique(train_gen.classes),
-        y=train_gen.classes
+    #class_weights = class_weight.compute_class_weight(
+    #    'balanced',
+    #    classes=np.unique(train_gen.classes),
+    #    y=train_gen.classes
+    #)
+    #class_weight_dict = dict(enumerate(class_weights))
+
+    # Class weighting
+    class_counts = np.bincount(train_gen.classes)
+    total = sum(class_counts)
+    class_weights = {i: (1.0 / (count / total)) * 0.5 for i, count in enumerate(class_counts)}
+    class_weights[1] *= 3.0  # Boost disgust class
+
+    # Optimizer with cosine decay
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=3e-4,
+        decay_steps=initial_epochs * len(train_gen)
     )
-    class_weight_dict = dict(enumerate(class_weights))
 
     # Phase 1: Frozen backbone
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-3),
-        loss='categorical_crossentropy',
+        optimizer=tf.keras.optimizers.AdamW(lr_schedule, weight_decay=1e-3),
+        loss=tf.keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0),
         metrics=['accuracy']
     )
 
     # Add learning rate reducer
-    lr_reducer = tf.keras.callbacks.ReduceLROnPlateau(
-        monitor='val_loss',
-        factor=0.5,
-        patience=3,
-        verbose=1
-    )
+    #lr_reducer = tf.keras.callbacks.ReduceLROnPlateau(
+    #    monitor='val_loss',
+    #    factor=0.5,
+    #    patience=3,
+    #    verbose=1
+    #)
+
+    # Callbacks
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
+        tf.keras.callbacks.ModelCheckpoint(
+            MODEL_PATH,
+            save_best_only=True,
+            monitor='val_accuracy',
+            mode='max'
+        )
+    ]
 
     # Early stopping to prevent overfitting
     initial_history = model.fit(
         train_gen,
         epochs=initial_epochs,
         validation_data=val_gen,
-        class_weight=class_weight_dict,
-        callbacks=[
-            lr_reducer,
-            tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-            tf.keras.callbacks.ModelCheckpoint('initial_best_resnet.keras', save_best_only=True)
-        ]
+        class_weight=class_weights,
+        callbacks=callbacks,
+        verbose=1
     )
 
     # Phase 2: Fine-tuning
@@ -338,37 +364,24 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
     for layer in base_model.layers[:100]: # Freeze first 140 layers (80% of total)
         layer.trainable = False
 
-    # Exponential decay learning rate for stable fine-tuning
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=1e-5,
-        decay_steps=len(train_gen)*fine_tune_epochs
-    )
-
     # Unfreeze last 35 layers (conv5_x blocks + top)
     #for layer in base_model.layers[140:]:
     #    layer.trainable = True
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=lr_schedule),
-        loss='categorical_crossentropy',
+        optimizer=tf.keras.optimizers.Adam(1e-5),
+        loss=tf.keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0),
         metrics=['accuracy']
-    )
-
-    # Add model checkpointing
-    checkpoint = tf.keras.callbacks.ModelCheckpoint(
-        MODEL_PATH,
-        monitor='val_accuracy',
-        save_best_only=True,
-        mode='max'
     )
 
     fine_tune_history = model.fit(
         train_gen,
+        initial_epoch=initial_history.epoch[-1] + 1,
         epochs=initial_epochs + fine_tune_epochs,
-        initial_epoch=initial_history.epoch[-1],
         validation_data=val_gen,
-        class_weight=class_weight_dict,
-        callbacks=[checkpoint, lr_reducer]
+        class_weight=class_weights,
+        callbacks=callbacks,
+        verbose=1
     )
 
     return model, initial_history, fine_tune_history
@@ -613,6 +626,28 @@ def evaluate_model(model, test_gen):
     # Calculate metrics
     print("\n=== Final Evaluation ===")
 
+    # Per-class recall calculation
+    recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
+
+    print("\n=== Detailed Class Metrics ===")
+    print(f"{'Class':<12} {'Recall':<8} {'Samples':<8}")
+    for i, class_name in enumerate(CLASS_NAMES):
+        class_samples = np.sum(y_true == i)
+        print(f"{class_name.capitalize():<12} {recall_per_class[i]:<8.2%} {class_samples:<8}")
+
+    # Visualize recall distribution
+    plt.figure(figsize=(10, 6))
+    sns.barplot(x=CLASS_NAMES, y=recall_per_class, palette="viridis")
+    plt.title("Per-Class Recall Scores")
+    plt.ylim(0, 1)
+    plt.xticks(rotation=45)
+    plt.ylabel("Recall")
+    plt.xlabel("Emotion Class")
+    plt.tight_layout()
+    plt.savefig('recall_distribution.png')
+    plt.close()
+
+
     # Basic evaluation
     test_loss = log_loss(y_true, y_pred_probs)
     test_acc = balanced_accuracy_score(y_true, y_pred)
@@ -657,7 +692,7 @@ def evaluate_model(model, test_gen):
     plt.savefig('confusion_matrix.png')  # Save to file
     plt.close()
 
-    return test_acc, f1, cm_normalized
+    return np.max(cm.diagonal())
 
 
 # ====================== MAIN EXECUTION ======================
@@ -721,7 +756,8 @@ def main():
     plot_combined_history(initial_history, fine_tune_history)
 
     # Comprehensive evaluation
-    test_acc, f1, cm = evaluate_model(best_model, test_gen)
+    max_acc = evaluate_model(best_model, test_gen)
+    print(f"\nMaximum Class Accuracy: {max_acc:.2%}")
 
 
 if __name__ == "__main__":
