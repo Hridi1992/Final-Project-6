@@ -1,13 +1,19 @@
 # ====================== IMPORTS AND CONFIGURATION ======================
 # Core Python utilities
+# Add at the very top 🔧
 import os
+os.environ['TF_KERAS_SAVE_FORMAT'] = 'keras'  # Force Keras v3 format
+#os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Suppress TensorFlow warnings
+import tensorflow as tf
+tf.get_logger().setLevel('ERROR')
+
+
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
 # Deep Learning framework
-import tensorflow as tf
 from tensorflow.keras import layers, models, regularizers
 from tensorflow.keras.layers import MultiHeadAttention, LayerNormalization
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -22,7 +28,9 @@ from sklearn.metrics import (
     balanced_accuracy_score
 )
 from sklearn.utils import class_weight
+from tensorflow.python.keras.models import save_model
 
+MODEL_PATH = os.path.abspath('best_model.keras')
 # ====================== DATA CONFIGURATION ======================
 # Dataset paths
 train_dir = r'C:\Users\User\Documents\OsuSpring2025\DeepLearning\FProject\.venv\train'  # Contains class subfolders
@@ -284,11 +292,6 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
     # Phase 1: Frozen backbone (Initial training with frozen base)
     print("\n=== Initial Training ===")
     model.get_layer("resnet50").trainable = False
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-4),
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
 
     # Class weight calculation
     class_weights = class_weight.compute_class_weight(
@@ -353,7 +356,7 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
 
     # Add model checkpointing
     checkpoint = tf.keras.callbacks.ModelCheckpoint(
-        'best_model.h5',
+        MODEL_PATH,
         monitor='val_accuracy',
         save_best_only=True,
         mode='max'
@@ -676,11 +679,23 @@ def main():
 
     # Training pipeline
     trained_model, initial_history, fine_tune_history = train_model(model, train_gen, val_gen,
-        initial_epochs=15,
-        fine_tune_epochs=20)
+        initial_epochs=1,
+        fine_tune_epochs=1)
+
+    # 🔧 Revised model loading with existence check
+    if os.path.exists(MODEL_PATH):
+        print(f"\nLoading best model from {MODEL_PATH}")
+        best_model = models.load_model(
+            MODEL_PATH,
+            custom_objects={'resnet_preprocess': resnet_preprocess}
+        )
+    else:
+        print("\nNo saved model found. Using final trained model.")
+        best_model = trained_model
+        best_model.save(MODEL_PATH, save_format='keras')
 
     # Load best performing model
-    best_model = models.load_model('best_model_resnet.keras',custom_objects={'resnet_preprocess': resnet_preprocess})
+    #best_model = models.load_model('best_model.keras',custom_objects={'resnet_preprocess': resnet_preprocess})
 
     # Get the ResNet50 base model from your architecture
     print("\n=== ResNet50 Layer Names ===")
