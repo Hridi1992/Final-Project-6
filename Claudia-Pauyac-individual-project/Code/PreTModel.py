@@ -21,6 +21,7 @@ from sklearn.metrics import (
     precision_score, top_k_accuracy_score, roc_auc_score,confusion_matrix,
     balanced_accuracy_score
 )
+from sklearn.utils import class_weight
 
 # ====================== DATA CONFIGURATION ======================
 # Dataset paths
@@ -55,26 +56,26 @@ def create_data_generators():
     """Create data pipelines with real-time augmentation"""
     # Training data augmentation configuration
     train_datagen = ImageDataGenerator(
-        rescale=1./255, # Normalize pixel values
-        rotation_range=25, # Random rotations ±15 degrees
-        width_shift_range=0.2, # Horizontal shift ±20% of width
-        height_shift_range=0.2, # Vertical shift ±20% of height
-        brightness_range=[0.8, 1.2],
-        shear_range=0.2,
-        zoom_range=0.2,
+        preprocessing_function=resnet_preprocess,
+        rotation_range=35, # Random rotations ±15 degrees
+        width_shift_range=0.25, # Horizontal shift ±20% of width
+        height_shift_range=0.25, # Vertical shift ±20% of height
+        brightness_range=[0.6, 1.4],
+        shear_range=0.3,
+        zoom_range=0.3,
         horizontal_flip=True, # Random left-right flips
-        fill_mode='nearest',
+        fill_mode='constant',
         validation_split=0.2 # Holdout 20% for validation
     )
 
     # Test/validation data preprocessing (only normalization)
-    test_datagen = ImageDataGenerator(rescale=1./255)
+    test_datagen = ImageDataGenerator(preprocessing_function=resnet_preprocess)
 
     # Training data generator
     train_generator = train_datagen.flow_from_directory(
         train_dir,
         target_size=(IMG_SIZE, IMG_SIZE),
-        color_mode='grayscale', # Convert to single-channel
+        color_mode='rgb', # Convert to single-channel
         batch_size=BATCH_SIZE,
         class_mode='categorical', # One-hot encoded labels
         classes=CLASS_NAMES,
@@ -85,7 +86,7 @@ def create_data_generators():
     val_generator = train_datagen.flow_from_directory(
         train_dir,
         target_size=(IMG_SIZE, IMG_SIZE),
-        color_mode='grayscale',
+        color_mode='rgb',
         batch_size=BATCH_SIZE,
         class_mode='categorical',
         classes=CLASS_NAMES,
@@ -97,7 +98,7 @@ def create_data_generators():
     test_generator = test_datagen.flow_from_directory(
         test_dir,
         target_size=(IMG_SIZE, IMG_SIZE),
-        color_mode='grayscale',
+        color_mode='rgb',
         batch_size=BATCH_SIZE,
         class_mode='categorical',
         classes=CLASS_NAMES,
@@ -134,10 +135,13 @@ def visualize_augmented_images(generator, num_samples=8, cols=4, figsize=(15, 6)
     for i in range(num_samples):
         ax = plt.subplot(rows, cols, i + 1)
 
-        # For grayscale images: squeeze channel dimension and use gray colormap
-        plt.imshow(images[i].squeeze(), cmap='gray')
+        # Reverse preprocessing and normalize for visualization
+        img = images[i].squeeze()
 
-        # Add class label as title
+        # Rescale from [-1, 1] to [0, 1]
+        img = (img - img.min()) / (img.max() - img.min())
+
+        plt.imshow(img, cmap='gray')
         plt.title(CLASS_NAMES[class_indices[i]])
         plt.axis("off")
 
@@ -195,60 +199,81 @@ def build_resnet_model():
         input_shape=(TARGET_SIZE, TARGET_SIZE, 3),
         name = 'resnet50'
     )
+
+    # Add spatial attention before ResNet
+    def channel_attention(input_tensor):
+        channel_axis = -1
+        avg = layers.GlobalAveragePooling2D()(input_tensor)
+        max = layers.GlobalMaxPooling2D()(input_tensor)
+        avg = layers.Reshape((1, 1, avg.shape[1]))(avg)
+        max = layers.Reshape((1, 1, max.shape[1]))(max)
+        concat = layers.Concatenate(axis=channel_axis)([avg, max])
+        conv = layers.Conv2D(1, (7, 7), padding='same', activation='sigmoid')(concat)
+        return layers.Multiply()([input_tensor, conv])
+
+    x = channel_attention(x)
     x = base_model(x) # Pass through ResNet50
 
     print(f"Total layers in ResNet50: {len(base_model.layers)}")
 
     # ========== HYBRID ARCHITECTURE ==========
     # 1. CNN Feature Enhancement
-    x = layers.Conv2D(512, (3, 3), padding='same', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = layers.Conv2D(512, (3, 3), activation='relu', padding='same')(x)
     x = layers.BatchNormalization()(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(0.3)(x) # Reduce overfitting
+    x = layers.Dropout(0.5)(x) # Reduce overfitting
+
+    # Global pooling and classification
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(7, activation='softmax')(x)
+
+    model = models.Model(inputs, outputs)
+    model.summary()
 
     # 2. Transformer Preparation
-    batch_size, height, width, channels = x.shape  # (None, 7, 7, 512)
-    x_reshape = layers.Reshape((height * width, channels))(x)  # (None, 49, 512)
+    #batch_size, height, width, channels = x.shape  # (None, 7, 7, 512)
+    #x_reshape = layers.Reshape((height * width, channels))(x)  # (None, 49, 512)
 
     # 3. Position Encoding
-    positions = tf.range(start=0, limit=height * width, delta=1)
-    position_embedding = layers.Embedding(
-        input_dim=height * width,
-        output_dim=channels
-    )(positions)  # (49, 512)
-    x_reshape += position_embedding  # Add positional information
+    #positions = tf.range(start=0, limit=height * width, delta=1)
+    #position_embedding = layers.Embedding(
+    #    input_dim=height * width,
+    #    output_dim=channels
+    #)(positions)  # (49, 512)
+    #x_reshape += position_embedding  # Add positional information
 
     # 4. Transformer Processing
-    x_transformer = transformer_block(x_reshape, num_heads=8, projection_dim=512)
-    x_transformer = transformer_block(x_transformer, num_heads=8, projection_dim=512)
+    #x_transformer = transformer_block(x_reshape, num_heads=8, projection_dim=512)
+    #x_transformer = transformer_block(x_transformer, num_heads=8, projection_dim=512)
 
     # 5. Feature Fusion
-    x_transformer = layers.Reshape((height, width, channels))(x_transformer)
+    #x_transformer = layers.Reshape((height, width, channels))(x_transformer)
     # 6. Combine CNN and Transformer paths
-    x = layers.concatenate([x, x_transformer], axis=-1)  # Combine CNN+Transformer
+    #x = layers.concatenate([x, x_transformer], axis=-1)  # Combine CNN+Transformer
     # ========== HYBRID ARCHITECTURE CHANGES END HERE ==========
 
     # ========== CLASSIFICATION HEAD ==========
     # Feature refinement
-    x = layers.Conv2D(filters=512, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001), padding='same')(x)
-    x = layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001)(x)
-    x = layers.Activation('relu')(x)
-    x = layers.Dropout(0.5)(x)
+    #x = layers.Conv2D(filters=512, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001), padding='same')(x)
+    #x = layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001)(x)
+    #x = layers.Activation('relu')(x)
+    #x = layers.Dropout(0.5)(x)
 
     # Global pooling and dense layers
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
-    x = layers.Dropout(0.5)(x)
-    x = layers.Dense(256, activation='relu')(x)
-    x = layers.Dropout(0.4)(x)
+    #x = layers.GlobalAveragePooling2D()(x)
+    #x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    #x = layers.Dropout(0.5)(x)
+    #x = layers.Dense(256, activation='relu')(x)
+    #x = layers.Dropout(0.5)(x)
 
     #x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.L2(0.001))(x)
     #x = layers.Dropout(0.5)(x)
 
     # Final classification layer
-    outputs = layers.Dense(7, activation='softmax')(x)
+    #outputs = layers.Dense(7, activation='softmax')(x)
 
-    return models.Model(inputs,outputs)
+    return model
 
 
 # ====================== TRAINING PIPELINE ======================
@@ -265,12 +290,37 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
         metrics=['accuracy']
     )
 
+    # Class weight calculation
+    class_weights = class_weight.compute_class_weight(
+        'balanced',
+        classes=np.unique(train_gen.classes),
+        y=train_gen.classes
+    )
+    class_weight_dict = dict(enumerate(class_weights))
+
+    # Phase 1: Frozen backbone
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-3),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    # Add learning rate reducer
+    lr_reducer = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        factor=0.5,
+        patience=3,
+        verbose=1
+    )
+
     # Early stopping to prevent overfitting
     initial_history = model.fit(
         train_gen,
         epochs=initial_epochs,
         validation_data=val_gen,
+        class_weight=class_weight_dict,
         callbacks=[
+            lr_reducer,
             tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
             tf.keras.callbacks.ModelCheckpoint('initial_best_resnet.keras', save_best_only=True)
         ]
@@ -282,14 +332,13 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
     base_model.trainable = True
 
     # Freeze initial layers, unfreeze later layers
-    for layer in base_model.layers[:140]: # Freeze first 140 layers (80% of total)
+    for layer in base_model.layers[:100]: # Freeze first 140 layers (80% of total)
         layer.trainable = False
 
     # Exponential decay learning rate for stable fine-tuning
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=1e-5,
-        decay_steps=1000,
-        decay_rate=0.9
+        decay_steps=len(train_gen)*fine_tune_epochs
     )
 
     # Unfreeze last 35 layers (conv5_x blocks + top)
@@ -302,15 +351,21 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
         metrics=['accuracy']
     )
 
+    # Add model checkpointing
+    checkpoint = tf.keras.callbacks.ModelCheckpoint(
+        'best_model.h5',
+        monitor='val_accuracy',
+        save_best_only=True,
+        mode='max'
+    )
+
     fine_tune_history = model.fit(
         train_gen,
         epochs=initial_epochs + fine_tune_epochs,
-        initial_epoch=initial_history.epoch[-1] + 1,
+        initial_epoch=initial_history.epoch[-1],
         validation_data=val_gen,
-        callbacks=[
-            tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
-            tf.keras.callbacks.ModelCheckpoint('best_model.keras', save_best_only=True)
-        ]
+        class_weight=class_weight_dict,
+        callbacks=[checkpoint, lr_reducer]
     )
 
     return model, initial_history, fine_tune_history
@@ -622,7 +677,7 @@ def main():
     # Training pipeline
     trained_model, initial_history, fine_tune_history = train_model(model, train_gen, val_gen,
         initial_epochs=15,
-        fine_tune_epochs=15)
+        fine_tune_epochs=20)
 
     # Load best performing model
     best_model = models.load_model('best_model_resnet.keras',custom_objects={'resnet_preprocess': resnet_preprocess})
