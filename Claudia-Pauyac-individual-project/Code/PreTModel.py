@@ -7,6 +7,7 @@ os.environ['TF_KERAS_SAVE_FORMAT'] = 'keras'  # Force Keras v3 format
 import tensorflow as tf
 tf.get_logger().setLevel('ERROR')
 
+
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -290,7 +291,10 @@ def build_resnet_model():
 
 
 # ====================== TRAINING PIPELINE ======================
-def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1):
+def train_model(model, train_gen, val_gen,
+                initial_epochs=20,
+                fine_tune_epochs=30,
+                final_tune_epochs=10):
     """Two-phase training process with transfer learning"""
     # Handle both initial training and fine-tuning phases"""
 
@@ -360,23 +364,62 @@ def train_model(model, train_gen, val_gen, initial_epochs=1, fine_tune_epochs=1)
     base_model.trainable = True
 
     # Freeze initial layers, unfreeze later layers
-    for layer in base_model.layers[:100]: # Freeze first 140 layers (80% of total)
-        layer.trainable = False
+    #for layer in base_model.layers[:100]: # Freeze first 140 layers (80% of total)
+    #    layer.trainable = False
 
-    # Unfreeze last 35 layers (conv5_x blocks + top)
-    #for layer in base_model.layers[140:]:
-    #    layer.trainable = True
+    # Define unfreezing schedule (layer index ranges)
+    unfreeze_schedule = [
+        (160, 175, 10, 1e-5),  # Last 15 layers, 10 epochs, 1e-5 lr
+        (140, 160, 15, 5e-6),  # Next 20 layers, 15 epochs, 5e-6 lr
+        (100, 140, 20, 1e-6)  # Next 40 layers, 20 epochs, 1e-6 lr
+    ]
+
+    total_epochs = initial_epochs
+    for start_idx, end_idx, epochs, lr in unfreeze_schedule:
+        # Freeze all except current range
+        for layer in base_model.layers:
+            layer.trainable = False
+        for layer in base_model.layers[start_idx:end_idx]:
+            layer.trainable = True
+
+        print(f"\nUnfreezing layers {start_idx}-{end_idx} (LR: {lr:.1e})")
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(lr),
+            loss=tf.keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0),
+            metrics=['accuracy']
+        )
+
+        history = model.fit(
+            train_gen,
+            initial_epoch=total_epochs,
+            epochs=total_epochs + epochs,
+            validation_data=val_gen,
+            class_weight=class_weights,
+            callbacks=callbacks,
+            verbose=1
+        )
+        total_epochs += epochs
+
+    print("\n=== Phase 3: Final Head Tuning ===")
+    # Freeze entire base model
+    base_model.trainable = False
+
+    # Only unfreeze classification layers
+    for layer in model.layers:
+        if "dense" in layer.name or "dropout" in layer.name:
+            layer.trainable = True
 
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(1e-5),
+        optimizer=tf.keras.optimizers.Adam(1e-7),
         loss=tf.keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0),
         metrics=['accuracy']
     )
 
     fine_tune_history = model.fit(
         train_gen,
-        initial_epoch=initial_history.epoch[-1] + 1,
-        epochs=initial_epochs + fine_tune_epochs,
+        initial_epoch=total_epochs,
+        epochs=total_epochs + final_tune_epochs,
         validation_data=val_gen,
         class_weight=class_weights,
         callbacks=callbacks,
@@ -726,9 +769,13 @@ def main():
     model = build_resnet_model()
 
     # Training pipeline
-    trained_model, initial_history, fine_tune_history = train_model(model, train_gen, val_gen,
+    trained_model, initial_history, fine_tune_history = train_model(model,
+        train_gen,
+        val_gen,
         initial_epochs=1,
-        fine_tune_epochs=1)
+        fine_tune_epochs=1,  # Sum of all progressive stage epochs
+        final_tune_epochs=1
+    )
 
     # 🔧 Revised model loading with existence check
     if os.path.exists(MODEL_PATH):
