@@ -1,111 +1,220 @@
-from statistics import mode
-
+# ========== ENVIRONMENT SETUP AND IMPORTS ==========
 import os
-import cv2
-import keras
-import numpy as np
+# Suppress TensorFlow warnings for cleaner output
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=all, 1=info, 2=warnings, 3=errors
+
+# Core machine learning and image processing libraries
+import cv2  # OpenCV for image processing
+import numpy as np  # Numerical operations
+from statistics import mode  # For calculating mode of recent predictions
 import tensorflow as tf
-from keras.models import load_model
-from keras.saving import register_keras_serializable
+from tensorflow.keras.layers import Lambda
+from tensorflow.keras.saving import register_keras_serializable
+from keras.models import load_model  # Load saved Keras models
+from keras.applications.resnet import preprocess_input  # ResNet preprocessing
 
-from utils.datasets import get_labels
-from utils.inference import detect_faces
-from utils.inference import draw_text
-from utils.inference import draw_bounding_box
-from utils.inference import apply_offsets
-from utils.inference import load_detection_model
-from utils.preprocessor import preprocess_input
+# Custom utility functions from project files
+from utils.datasets import get_labels  # Get emotion label names
+from utils.inference import (  # Face detection and visualization functions
+    detect_faces, draw_text,
+    draw_bounding_box, apply_offsets,
+    load_detection_model
+)
 
-# parameters for loading data and images
+# ========== CONFIGURATION SETTINGS ==========
+# Path to Haar Cascade face detection model
 detection_model_path = r'C:\Users\User\Documents\OsuSpring2025\DeepLearning\FProject\.venv\detection_model\haarcascade_frontalface_default.xml'
+# Path to trained emotion recognition model
 emotion_model_path = r'C:\Users\User\Documents\OsuSpring2025\DeepLearning\FProject\.venv\emotion_model\best_model.h5'
+# Get human-readable emotion labels from FER2013 dataset
 emotion_labels = get_labels('fer2013')
 
-# hyper-parameters for bounding boxes shape
+# Number of frames to consider for mode calculation
 frame_window = 10
+# Offset values for expanding face detection region (pixels)
 emotion_offsets = (20, 40)
 
-# Register custom preprocessing function
+# ========== CUSTOM LAYER DEFINITIONS ==========
 @register_keras_serializable(package="Custom")
-def resnet_preprocess(x):
-    x = x / 127.5 - 1.0  # Example ResNet scaling
-    return x
+class ResNetLambda(Lambda):
+    """Custom Lambda layer to handle ResNet preprocessing with explicit output shape"""
+    def __init__(self, **kwargs):
+        # Set expected output dimensions (matches ResNet input size)
+        self.output_dim = (224, 224, 3)
+        # Initialize parent Lambda layer with preprocessing function
+        super().__init__(resnet_preprocess, **kwargs)
 
-# Load models with error handling
+    def compute_output_shape(self, input_shape):
+        """Ensure output shape matches ResNet requirements"""
+        return (input_shape[0], *self.output_dim)
+
+    def get_config(self):
+        """Serialization configuration for model saving/loading"""
+        config = super().get_config()
+        config.update({'output_dim': self.output_dim})
+        return config
+
+# ========== PREPROCESSING FUNCTION ==========
+@register_keras_serializable(package="Custom", name="resnet_preprocess")
+def resnet_preprocess(x):
+    """Preprocess input for ResNet model using TensorFlow operations
+    - Converts to float32
+    - Applies channel-wise mean subtraction
+    - Returns values in [-1, 1] range
+    """
+    return tf.keras.applications.resnet.preprocess_input(
+        tf.cast(x, tf.float32)
+    )
+
+
+# ========== MODEL LOADING ==========
+# Global variables for loaded models
+face_detection = None # Haar Cascade face detector
+emotion_classifier = None # Emotion recognition model
+
 try:
+    # Load face detection model (Haar Cascade classifier)
     face_detection = load_detection_model(detection_model_path)
-    emotion_classifier = load_model(emotion_model_path, compile=False)
+
+    # Load emotion recognition model with custom objects
+    emotion_classifier = load_model(
+        emotion_model_path,
+        compile=False, # No need for compilation during inference
+        custom_objects={
+            'resnet_preprocess': resnet_preprocess # Register custom preprocessing
+        }
+    )
 except Exception as e:
     print(f"Error loading models: {e}")
     exit()
 
-# getting input model shapes for inference
-emotion_target_size = emotion_classifier.input_shape[1:3]
-
-# starting lists for calculating modes
-emotion_window = []
-
-# starting video streaming
-cv2.namedWindow('window_frame')
-video_capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-
-# Add error checking
-if not video_capture.isOpened():
-    print("Error: Could not open camera!")
+# Verify both models loaded successfully
+if face_detection is None or emotion_classifier is None:
+    print("Critical Error: Failed to load one or more models")
     exit()
 
-while True:
-    bgr_image = video_capture.read()[1]
-    gray_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
-    rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-    faces = detect_faces(face_detection, gray_image)
+# ========== MAIN PROCESSING FUNCTION ==========
+def main():
+    global face_detection, emotion_classifier
 
-    for face_coordinates in faces:
+    # Initialize video capture from default camera
+    video_capture = cv2.VideoCapture(0, cv2.CAP_DSHOW) # DirectShow backend for Windows
+    if not video_capture.isOpened():
+        print("Error: Could not open camera!")
+        return
 
-        x1, x2, y1, y2 = apply_offsets(face_coordinates, emotion_offsets)
-        gray_face = gray_image[y1:y2, x1:x2]
-        try:
-            gray_face = cv2.resize(gray_face, (emotion_target_size))
-        except:
-            continue
+    # Get model input dimensions from loaded model
+    emotion_target_size = emotion_classifier.input_shape[1:3]  # Expected (height, width)
+    # Buffer for storing recent emotion predictions
+    emotion_window = []
 
-        gray_face = preprocess_input(gray_face, True)
-        gray_face = np.expand_dims(gray_face, 0)
-        gray_face = np.expand_dims(gray_face, -1)
-        emotion_prediction = emotion_classifier.predict(gray_face)
-        emotion_probability = np.max(emotion_prediction)
-        emotion_label_arg = np.argmax(emotion_prediction)
-        emotion_text = emotion_labels[emotion_label_arg]
-        emotion_window.append(emotion_text)
+    # Full emotion color mapping in BGR format
+    color_map = {
+        'angry': (0, 0, 255),  # Red
+        'disgust': (0, 255, 0),  # Green
+        'fear': (128, 0, 128),  # Purple
+        'sad': (255, 0, 0),  # Blue
+        'happy': (0, 255, 255),  # Yellow
+        'surprise': (255, 0, 255),  # Pink/Magenta
+        'neutral': (230, 216, 173)  # Light Blue
+    }
 
-        if len(emotion_window) > frame_window:
-            emotion_window.pop(0)
-        try:
-            emotion_mode = mode(emotion_window)
-        except:
-            continue
+    # Main processing loop
+    while True:
+        # Read frame from camera
+        ret, frame = video_capture.read()
+        if not ret:
+            break # Exit if frame capture fails
 
-        if emotion_text == 'angry':
-            color = emotion_probability * np.asarray((255, 0, 0))
-        elif emotion_text == 'sad':
-            color = emotion_probability * np.asarray((0, 0, 255))
-        elif emotion_text == 'happy':
-            color = emotion_probability * np.asarray((255, 255, 0))
-        elif emotion_text == 'surprise':
-            color = emotion_probability * np.asarray((0, 255, 255))
-        else:
-            color = emotion_probability * np.asarray((0, 255, 0))
+        # Convert frame to RGB for processing and grayscale for face detection
+        gray_image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        color = color.astype(int)
-        color = color.tolist()
+        # Detect faces using Haar Cascade classifier
+        faces = detect_faces(face_detection, gray_image) if face_detection else []
 
-        draw_bounding_box(face_coordinates, rgb_image, color)
-        draw_text(face_coordinates, rgb_image, emotion_mode,
-                  color, 0, -45, 1, 1)
+        # Process each detected face
+        for face_coordinates in faces:
+            try:
+                # Apply offsets to expand face region
+                x1, x2, y1, y2 = apply_offsets(face_coordinates, emotion_offsets)
 
-    bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
-    cv2.imshow('window_frame', bgr_image)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-video_capture.release()
-cv2.destroyAllWindows()
+                # ========== SAFETY CHECKS ==========
+                # Get image dimensions
+                h, w = gray_image.shape[:2]
+
+                # Clamp coordinates to valid range
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(w, x2)
+                y2 = min(h, y2)
+
+                # Skip invalid regions
+                if x1 >= x2 or y1 >= y2:
+                    continue
+
+                # Extract face region from RGB image
+                face_region = frame[y1:y2, x1:x2]
+
+                # Skip empty regions (safety check)
+                if face_region.size == 0:
+                    continue
+
+                # Resize to model input size
+                face_region_rgb = cv2.cvtColor(face_region, cv2.COLOR_BGR2RGB)
+                face_resized = cv2.resize(face_region, emotion_target_size)
+
+                # Ensure 3-channel input (convert grayscale to RGB)
+                if len(face_resized.shape) == 2:
+                    face_resized = np.stack([face_resized] * 3, axis=-1)
+
+                # ========== PREPROCESSING ==========
+                # Apply ResNet-specific preprocessing
+                face_processed = resnet_preprocess(face_resized)
+                # Add batch dimension (model expects batches)
+                face_processed = np.expand_dims(face_processed, axis=0)
+
+                # ========== EMOTION PREDICTION ==========
+                predictions = emotion_classifier.predict(face_processed)
+                emotion_idx = np.argmax(predictions) # Get most probable emotion
+                emotion_text = emotion_labels[emotion_idx]
+                emotion_prob = np.max(predictions) # Get confidence score
+
+                # ========== UPDATE PREDICTION HISTORY ==========
+                emotion_window.append(emotion_text)
+                # Maintain fixed-size window of predictions
+                if len(emotion_window) > frame_window:
+                    emotion_window.pop(0)
+
+                # ========== VISUALIZATION ==========
+                # Get color from BGR color map and adjust intensity
+                base_color = color_map.get(emotion_text, (230, 216, 173))  # Default light blue
+                color = np.array(base_color) * emotion_prob
+                color = color.astype(int).tolist()
+
+                # Draw bounding box and text on RGB image
+                draw_bounding_box(face_coordinates, frame, color)
+                current_emotion = mode(emotion_window) if emotion_window else emotion_text
+                draw_text(
+                    face_coordinates, frame,
+                    current_emotion,
+                    color, 0, -45, 1, 2
+                ) # Text position and styling
+
+            except Exception as e:
+                print(f"Face processing error: {e}")
+                continue
+
+        # Convert back to BGR for OpenCV display
+        cv2.imshow('Emotion Analysis', frame)
+
+        # Exit on 'q' key press
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Cleanup resources
+    video_capture.release()
+    cv2.destroyAllWindows()
+
+# ========== ENTRY POINT ==========
+if __name__ == "__main__":
+    main()
