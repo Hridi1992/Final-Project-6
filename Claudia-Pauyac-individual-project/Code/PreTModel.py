@@ -1,10 +1,10 @@
 # ====================== IMPORTS AND CONFIGURATION ======================
+# Core Python utilities
 import os
 os.environ['TF_KERAS_SAVE_FORMAT'] = 'keras'  # Force Keras v3 format
 import tensorflow as tf
 tf.get_logger().setLevel('ERROR')
 
-# Core Python utilities
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -42,7 +42,6 @@ BATCH_SIZE = 32 # Number of samples processed before model update
 
 # Emotion class labels
 CLASS_NAMES = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
-
 
 @register_keras_serializable(package="Custom", name="resnet_preprocess")
 def resnet_preprocess(x):
@@ -191,50 +190,52 @@ def visualize_augmented_images(generator, num_samples=8, cols=4, figsize=(15, 6)
 
 
 # ====================== MODEL ARCHITECTURE ======================
-def transformer_block(x, num_heads=4, projection_dim=512, dropout_rate=0.1):
-    """
-    Transformer encoder block with self-attention and feed-forward network.
+def efficient_transformer_block(x, num_heads=4, projection_dim=None, dropout=0.1):
+    """Lightweight transformer with automatic dimension matching"""
+    input_channels = x.shape[-1]
+    projection_dim = projection_dim or input_channels
 
-    Args:
-        x (tensor): Input tensor
-        num_heads (int): Number of attention heads
-        projection_dim (int): Dimension of key/query vectors
-        dropout_rate (float): Dropout probability
-
-    Returns:
-        tensor: Output tensor after transformer operations
-    """
-    # Multi-head self-attention mechanism
-    attention_output = MultiHeadAttention(
+    # Self-attention with dimension preservation
+    attn = MultiHeadAttention(
         num_heads=num_heads,
-        key_dim=projection_dim // num_heads,  # Split dimension across heads
-        dropout=dropout_rate
-    )(x, x)  # Self-attention (q=k=v=x)
+        key_dim=projection_dim // num_heads,
+        dropout=dropout
+    )(x, x)
 
-    # First residual connection + layer norm
-    x = LayerNormalization(epsilon=1e-6)(x + attention_output)
+    # Residual connection with dimension matching
+    if attn.shape[-1] != input_channels:
+        attn = layers.Conv2D(input_channels, 1)(attn)
+    x = LayerNormalization(epsilon=1e-6)(x + attn)
 
-    # Feed-forward network (FFN)
-    ffn = layers.Dense(projection_dim * 2, activation="gelu")(x)  # Expand features
-    ffn = layers.Dense(projection_dim)(ffn)  # Compress back
-    ffn = layers.Dropout(dropout_rate)(ffn)  # Regularization
+    # Feed-forward with dimension restoration
+    ffn = layers.Conv2D(projection_dim * 4, 1, activation='gelu')(x)
+    ffn = layers.Conv2D(input_channels, 1)(ffn)
+    ffn = layers.Dropout(dropout)(ffn)
 
-    # Second residual connection + layer norm
     return LayerNormalization(epsilon=1e-6)(x + ffn)
 
 
-# ====================== MODEL ARCHITECTURE ======================
+def build_class_branch(x, emotion):
+    """Specialized branch for challenging emotions"""
+    # Channel attention
+    channel_att = layers.GlobalAvgPool2D()(x)
+    channel_att = layers.Dense(x.shape[-1], activation='sigmoid')(channel_att)
+    x_att = layers.Multiply()([x, channel_att])
+
+    # Spatial attention
+    spatial_att = layers.Conv2D(1, 7, activation='sigmoid')(x_att)
+    x_att = layers.Multiply()([x_att, spatial_att])
+
+    # Emotion-specific features
+    x_out = layers.GlobalAvgPool2D()(x_att)
+    x_out = layers.Dense(128, activation='gelu')(x_out)
+    return x_out
+
+
 def build_resnet_model():
     """Build hybrid CNN-Transformer architecture"""
     # Input layer for grayscale images
     inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1))
-
-    # ========== DATA AUGMENTATION ==========
-    # Real-time augmentation during training
-    #x = layers.RandomFlip("horizontal")(inputs)
-    #x = layers.RandomRotation(0.15)(x) # ±15% rotation
-    #x = layers.RandomZoom(0.1)(x) # ±10% zoom
-    #x = layers.RandomContrast(0.1)(x) # ±10% contrast variation
 
     # ========== PREPROCESSING ==========
     # Resize to ResNet input size
@@ -254,45 +255,50 @@ def build_resnet_model():
         weights='imagenet', # Pre-trained on ImageNet
         include_top=False, # Exclude classification layers
         input_shape=(TARGET_SIZE, TARGET_SIZE, 3),
+        pooling=None,
         name = 'resnet50'
     )
 
     # Add spatial attention before ResNet
-    def channel_attention(input_tensor):
-        channel_axis = -1
-        avg = layers.GlobalAveragePooling2D()(input_tensor)
-        max = layers.GlobalMaxPooling2D()(input_tensor)
-        avg = layers.Reshape((1, 1, avg.shape[1]))(avg)
-        max = layers.Reshape((1, 1, max.shape[1]))(max)
-        concat = layers.Concatenate(axis=channel_axis)([avg, max])
-        conv = layers.Conv2D(1, (7, 7), padding='same', activation='sigmoid')(concat)
-        return layers.Multiply()([input_tensor, conv])
+    #def channel_attention(input_tensor):
+    #    channel_axis = -1
+    #    avg = layers.GlobalAveragePooling2D()(input_tensor)
+    #    max = layers.GlobalMaxPooling2D()(input_tensor)
+    #    avg = layers.Reshape((1, 1, avg.shape[1]))(avg)
+    #    max = layers.Reshape((1, 1, max.shape[1]))(max)
+    #    concat = layers.Concatenate(axis=channel_axis)([avg, max])
+    #    conv = layers.Conv2D(1, (7, 7), padding='same', activation='sigmoid')(concat)
+    #    return layers.Multiply()([input_tensor, conv])
+
+    # Strategic layer unfreezing
+    for layer in base_model.layers[:100]:
+        layer.trainable = False
 
     x = base_model(x)
-    x = channel_attention(x)
-     # Pass through ResNet50
+    transformer_dim = x.shape[-1]
+    #x = channel_attention(x)
+
+    # Transformer-enhanced feature refinement
+    x = efficient_transformer_block(
+        x,
+        num_heads=8,
+    )
+
+    # Class-specific attention branches
+    angry_branch = build_class_branch(x, 'angry')
+    fear_branch = build_class_branch(x, 'fear')
+    disgust_branch = build_class_branch(x, 'disgust')
+    sad_branch = build_class_branch(x, 'sad')
+    main_branch = layers.GlobalAvgPool2D()(x)
+
+    # Fusion layer
+    combined = layers.Concatenate()([main_branch, angry_branch, disgust_branch, fear_branch, sad_branch])
+    combined = layers.Dense(512, activation='gelu')(combined)
+
+    # Output
+    outputs = layers.Dense(7, activation='softmax')(combined)
 
     print(f"Total layers in ResNet50: {len(base_model.layers)}")
-
-    # ========== HYBRID ARCHITECTURE ==========
-    # 1. CNN Feature Enhancement
-    x = layers.Conv2D(1024, (3, 3), activation='swish', padding='same')(x)
-    x = layers.BatchNormalization(
-        momentum=0.99,
-        epsilon=1e-06,
-        gamma_initializer='glorot_uniform'
-    )(x)
-    x = layers.Dropout(
-        0.6,
-        noise_shape=(None, 1, 1, x.shape[-1])  # Variational dropout
-    )(x)
-
-    # Global pooling and classification
-    x = layers.GlobalAveragePooling2D()(x)
-    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l1_l2(l1=1e-5, l2=1e-4))(x)
-    x = layers.Dropout(0.5)(x)
-    outputs = layers.Dense(7, activation='softmax',
-                         kernel_initializer='lecun_normal')(x)
 
     model = models.Model(inputs, outputs)
     # Enable mixed precision training
@@ -300,50 +306,85 @@ def build_resnet_model():
 
     model.summary()
 
-    # 2. Transformer Preparation
-    #batch_size, height, width, channels = x.shape  # (None, 7, 7, 512)
-    #x_reshape = layers.Reshape((height * width, channels))(x)  # (None, 49, 512)
-
-    # 3. Position Encoding
-    #positions = tf.range(start=0, limit=height * width, delta=1)
-    #position_embedding = layers.Embedding(
-    #    input_dim=height * width,
-    #    output_dim=channels
-    #)(positions)  # (49, 512)
-    #x_reshape += position_embedding  # Add positional information
-
-    # 4. Transformer Processing
-    #x_transformer = transformer_block(x_reshape, num_heads=8, projection_dim=512)
-    #x_transformer = transformer_block(x_transformer, num_heads=8, projection_dim=512)
-
-    # 5. Feature Fusion
-    #x_transformer = layers.Reshape((height, width, channels))(x_transformer)
-    # 6. Combine CNN and Transformer paths
-    #x = layers.concatenate([x, x_transformer], axis=-1)  # Combine CNN+Transformer
-    # ========== HYBRID ARCHITECTURE CHANGES END HERE ==========
-
-    # ========== CLASSIFICATION HEAD ==========
-    # Feature refinement
-    #x = layers.Conv2D(filters=512, kernel_size=(3, 3), strides=(1, 1), kernel_regularizer=regularizers.L2(0.001), padding='same')(x)
-    #x = layers.BatchNormalization(axis=-1, momentum=0.99, epsilon=0.001)(x)
-    #x = layers.Activation('relu')(x)
-    #x = layers.Dropout(0.5)(x)
-
-    # Global pooling and dense layers
-    #x = layers.GlobalAveragePooling2D()(x)
-    #x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
-    #x = layers.Dropout(0.5)(x)
-    #x = layers.Dense(256, activation='relu')(x)
-    #x = layers.Dropout(0.5)(x)
-
-    #x = layers.Dense(128, activation='relu', kernel_regularizer=regularizers.L2(0.001))(x)
-    #x = layers.Dropout(0.5)(x)
-
-    # Final classification layer
-    #outputs = layers.Dense(7, activation='softmax')(x)
-
     return model
 
+
+# ====================== DATA PIPELINE ENHANCEMENTS ======================
+class BalancedDataGenerator(tf.keras.utils.Sequence):
+    """Class-aware augmentation pipeline with proper batch handling"""
+
+    def __init__(self, base_generator, augment_dict):
+        self.base_gen = base_generator
+        self.augment_dict = augment_dict
+        self.classes = base_generator.classes
+
+    def __len__(self):
+        return len(self.base_gen)
+
+    def __getitem__(self, idx):
+        x_batch, y_batch = self.base_gen[idx]
+
+        # Process each sample individually
+        augmented_batch = []
+        for i in range(x_batch.shape[0]):
+            x = x_batch[i]
+            y = y_batch[i]
+
+            # Get class index for this sample
+            class_idx = np.argmax(y)
+
+            if class_idx in self.augment_dict:
+                # Add batch dimension for augmentation
+                x_aug = np.expand_dims(x, axis=0)
+                augmented = self.augment_dict[class_idx].random_transform(x_aug[0])
+                augmented_batch.append(augmented)
+            else:
+                augmented_batch.append(x)
+
+        return np.stack(augmented_batch, axis=0), y_batch
+
+
+def create_class_aware_generators():
+    """Configure data generators with enhanced augmentation"""
+    # Base generators
+    train_gen, val_gen, test_gen = create_data_generators()
+
+    # Class-specific augmentation
+    augment_strategies = {
+        1: ImageDataGenerator(  # Disgust
+            rotation_range=45,
+            width_shift_range=0.3,
+            zoom_range=0.5,
+            fill_mode='constant'
+        ),
+        2: ImageDataGenerator(  # Fear
+            width_shift_range=0.25,
+            height_shift_range=0.25,
+            brightness_range=[0.4, 1.6]
+        )
+    }
+
+    return (
+        BalancedDataGenerator(train_gen, augment_strategies),
+        val_gen,
+        test_gen
+    )
+
+# ====================== TRAINING STRATEGY ======================
+# ====================== CUSTOM LOSS FUNCTION ======================
+class AdaptiveFocalLoss(tf.keras.losses.Loss):
+    """Class-weighted focal loss with dynamic gamma"""
+    def __init__(self, class_weights_list, gamma=2.0, name="adaptive_focal_loss"):
+        super().__init__(name=name)
+        self.class_weights = tf.constant(class_weights_list, dtype=tf.float32)
+        self.gamma = gamma
+
+    def call(self, y_true, y_pred):
+        ce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+        pt = tf.math.exp(-ce)
+        focal_loss = tf.math.pow(1 - pt, self.gamma) * ce
+        weights = tf.reduce_sum(self.class_weights * y_true, axis=-1)
+        return tf.reduce_mean(focal_loss * weights)
 
 # ====================== TRAINING PIPELINE ======================
 def train_model(model, train_gen, val_gen,
@@ -351,89 +392,83 @@ def train_model(model, train_gen, val_gen,
                 fine_tune_epochs=30,
                 final_tune_epochs=10):
     """Two-phase training process with transfer learning"""
-    # Handle both initial training and fine-tuning phases"""
-
-    # Phase 1: Frozen backbone (Initial training with frozen base)
-    print("\n=== Initial Training ===")
-    model.get_layer("resnet50").trainable = False
-
-    # Class weight calculation
-    #class_weights = class_weight.compute_class_weight(
-    #    'balanced',
-    #    classes=np.unique(train_gen.classes),
-    #    y=train_gen.classes
-    #)
-    #class_weight_dict = dict(enumerate(class_weights))
-
-    # Class weighting
+    # Calculate class weights as dictionary for Keras and list for loss
     class_counts = np.bincount(train_gen.classes)
-    total = sum(class_counts)
-    class_weights = {i: (1.0 / (count / total)) * 0.5 for i, count in enumerate(class_counts)}
-    class_weights[1] *= 3.0  # Boost disgust class
+    total_samples = sum(class_counts)
+    num_classes = len(class_counts)
 
-    # Optimizer with cosine decay
+    # Create both representations
+    class_weights_dict = {
+        i: (1.0 / (count / total_samples)) * 0.5
+        for i, count in enumerate(class_counts)
+    }
+    class_weights_dict[1] *= 3.0  # Boost disgust class
+
+    class_weights_list = [class_weights_dict[i] for i in range(num_classes)]
+
+    # Common callbacks
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            patience=15,
+            monitor='val_loss',
+            restore_best_weights=True
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            'best_model.keras',
+            monitor='val_accuracy',
+            save_best_only=True,
+            mode='max'
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=5,
+            min_lr=1e-7
+        )
+    ]
+
+    # Phase 1: Initial training with frozen base
+    base_model = model.get_layer("resnet50")
+    base_model.trainable = False
+
+    # Custom learning rate schedule
     lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
         initial_learning_rate=3e-4,
         decay_steps=initial_epochs * len(train_gen)
     )
 
-    # Phase 1: Frozen backbone
     model.compile(
         optimizer=tf.keras.optimizers.AdamW(lr_schedule, weight_decay=1e-3),
-        loss=tf.keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0),
-        metrics=['accuracy']
+        loss=AdaptiveFocalLoss(class_weights_list),
+        metrics=['accuracy', tf.keras.metrics.Recall(class_id=1)]
     )
 
-    # Add learning rate reducer
-    #lr_reducer = tf.keras.callbacks.ReduceLROnPlateau(
-    #    monitor='val_loss',
-    #    factor=0.5,
-    #    patience=3,
-    #    verbose=1
-    #)
-
-    # Callbacks
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(patience=15, restore_best_weights=True),
-        tf.keras.callbacks.ModelCheckpoint(
-            MODEL_PATH,
-            save_best_only=True,
-            monitor='val_accuracy',
-            mode='max'
-        )
-    ]
-
-    # Early stopping to prevent overfitting
+    print("\n=== Phase 1: Initial Training ===")
     initial_history = model.fit(
         train_gen,
+        initial_epoch=0,  # Start from epoch 0
         epochs=initial_epochs,
         validation_data=val_gen,
-        class_weight=class_weights,
+        class_weight=class_weights_dict,
         callbacks=callbacks,
         verbose=1
     )
 
-    # Phase 2: Fine-tuning
-    print("\n=== Fine-Tuning ===")
-    base_model = model.get_layer("resnet50")
-    base_model.trainable = True
+    # Collect all histories
+    all_histories = [initial_history]
+    current_epoch = initial_epochs
 
-    # Freeze initial layers, unfreeze later layers
-    #for layer in base_model.layers[:100]: # Freeze first 140 layers (80% of total)
-    #    layer.trainable = False
-
-    # Define unfreezing schedule (layer index ranges)
+    # Phase 2: Progressive fine-tuning
+    print("\n=== Phase 2: Fine-Tuning ===")
     unfreeze_schedule = [
-        (160, 175, 10, 1e-5),  # Last 15 layers, 10 epochs, 1e-5 lr
-        (140, 160, 15, 5e-6),  # Next 20 layers, 15 epochs, 5e-6 lr
-        (100, 140, 20, 1e-6)  # Next 40 layers, 20 epochs, 1e-6 lr
+        (160, 175, 10, 1e-5),  # Last 15 layers
+        (140, 160, 15, 5e-6),  # Middle layers
+        (100, 140, 20, 1e-6)  # Earlier layers
     ]
 
-    total_epochs = initial_epochs
     for start_idx, end_idx, epochs, lr in unfreeze_schedule:
         # Freeze all except current range
-        for layer in base_model.layers:
-            layer.trainable = False
+        base_model.trainable = False
         for layer in base_model.layers[start_idx:end_idx]:
             layer.trainable = True
 
@@ -441,47 +476,53 @@ def train_model(model, train_gen, val_gen,
 
         model.compile(
             optimizer=tf.keras.optimizers.Adam(lr),
-            loss=tf.keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0),
+            loss=AdaptiveFocalLoss(class_weights_list),
             metrics=['accuracy']
         )
 
-        history = model.fit(
+        phase_history = model.fit(
             train_gen,
-            initial_epoch=total_epochs,
-            epochs=total_epochs + epochs,
+            initial_epoch=current_epoch,
+            epochs=current_epoch + epochs,
             validation_data=val_gen,
-            class_weight=class_weights,
+            class_weight=class_weights_dict,
             callbacks=callbacks,
             verbose=1
         )
-        total_epochs += epochs
+        all_histories.append(phase_history)
+        current_epoch += epochs
 
-    print("\n=== Phase 3: Final Head Tuning ===")
-    # Freeze entire base model
+    # Phase 3: Final head tuning
+    print("\n=== Phase 3: Final Tuning ===")
     base_model.trainable = False
-
-    # Only unfreeze classification layers
     for layer in model.layers:
-        if "dense" in layer.name or "dropout" in layer.name:
+        if "dense" in layer.name or "attention" in layer.name:
             layer.trainable = True
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(1e-7),
-        loss=tf.keras.losses.CategoricalFocalCrossentropy(alpha=0.25, gamma=2.0),
+        loss=AdaptiveFocalLoss(class_weights_list),
         metrics=['accuracy']
     )
 
-    fine_tune_history = model.fit(
+    final_history = model.fit(
         train_gen,
-        initial_epoch=total_epochs,
-        epochs=total_epochs + final_tune_epochs,
+        initial_epoch=current_epoch,
+        epochs=current_epoch + final_tune_epochs,
         validation_data=val_gen,
-        class_weight=class_weights,
+        class_weight=class_weights_dict,
         callbacks=callbacks,
         verbose=1
     )
+    all_histories.append(final_history)
 
-    return model, initial_history, fine_tune_history
+    # Combine all histories
+    combined_history = defaultdict(list)
+    for history in all_histories:
+        for key, values in history.history.items():
+            combined_history[key].extend(values)
+
+    return model, combined_history
 
 
 # ====================== VISUALIZATION & EVALUATION ======================
@@ -715,25 +756,16 @@ def plot_resnet_feature_maps(model, input_image, rows=4, cols=8,
         plt.close()
 
 
-def plot_combined_history(initial_history, fine_tune_history, output_dir='training_history'):
+def plot_combined_history(history, output_dir='training_history'):
     """
-    Visualize and save combined training history from two phases.
-
-    Args:
-        initial_history: History object from initial training
-        fine_tune_history: History object from fine-tuning
-        output_dir (str): Output directory path
+    Visualize training history with correct epoch numbering.
     """
-    # Combine metrics from both phases
-    acc = initial_history.history['accuracy'] + fine_tune_history.history['accuracy']
-    val_acc = initial_history.history['val_accuracy'] + fine_tune_history.history['val_accuracy']
-    loss = initial_history.history['loss'] + fine_tune_history.history['loss']
-    val_loss = initial_history.history['val_loss'] + fine_tune_history.history['val_loss']
-
-    # Create epoch range
+    acc = history['accuracy']
+    val_acc = history['val_accuracy']
+    loss = history['loss']
+    val_loss = history['val_loss']
     epochs = range(1, len(acc) + 1)
 
-    # Create figure
     plt.figure(figsize=(14, 5))
 
     # Accuracy subplot
@@ -754,16 +786,13 @@ def plot_combined_history(initial_history, fine_tune_history, output_dir='traini
     plt.ylabel('Loss')
     plt.legend()
 
-    # Save and close
     plt.tight_layout()
     os.makedirs(output_dir, exist_ok=True)
     plt.savefig(os.path.join(output_dir, "training_history.png"))
     plt.close()
 
-    print(f"Training history saved to {output_dir}/training_history.png")
 
-
-def evaluate_model(model, test_gen, class_names, output_dir='evaluation_results'):
+def evaluate_model(model, test_gen, class_names, output_dir='results'):
     """
     Comprehensive model evaluation with visualizations.
 
@@ -869,16 +898,17 @@ def main():
         num_samples=30,  # Generate 30 sample images
         cols=6,  # 6-column grid layout
         figsize=(15, 8),  # Large figure for clarity
-        output_dir='augmented_images'  # Save to dedicated folder
+        output_dir='augmentedImages'  # Save to dedicated folder
     )
 
     # ====================== MODEL SETUP ======================
     # Construct model architecture
     model = build_resnet_model()  # Custom ResNet-based architecture
+    train_gen, val_gen, test_gen = create_class_aware_generators()
 
     # ====================== TRAINING PHASES ======================
     # Execute multi-phase training process
-    trained_model, initial_history, fine_tune_history = train_model(
+    trained_model, combined_history = train_model(
         model=model,
         train_gen=train_gen,
         val_gen=val_gen,
@@ -957,8 +987,7 @@ def main():
     # ====================== TRAINING ANALYSIS ======================
     # Visualize training progress across phases
     plot_combined_history(
-        initial_history=initial_history,  # Feature extraction phase
-        fine_tune_history=fine_tune_history,  # Fine-tuning phase
+        combined_history,
         output_dir='results'  # Save visualization to results/
     )
 
@@ -966,7 +995,9 @@ def main():
     # Comprehensive model performance assessment
     max_acc = evaluate_model(
         model=best_model,
-        test_gen=test_gen  # Use held-out test set
+        test_gen=test_gen,  # Use held-out test set
+        class_names=CLASS_NAMES,
+        output_dir = 'results'
     )
     print(f"\nMaximum Class Accuracy: {max_acc:.2%}")  # Display peak performance
 
