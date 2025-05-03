@@ -201,7 +201,11 @@ def build_resnet_model():
     # Convert grayscale to RGB by repeating channels
     x = layers.Concatenate()([x, x, x])
     # Apply ResNet50 specific preprocessing
-    x = layers.Lambda(resnet_preprocess)(x)  # Official ResNet50 preprocessing
+    x = layers.Lambda(
+        resnet_preprocess,
+        name="resnet_preprocess",
+        output_shape=(TARGET_SIZE,TARGET_SIZE, 3)
+    )(x)  # Official ResNet50 preprocessing
 
     # ========== BASE MODEL ==========
     # Initialize pre-trained ResNet50 without top layers
