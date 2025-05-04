@@ -1,51 +1,53 @@
 # ====================== IMPORTS AND CONFIGURATION ======================
 # Core Python utilities
 import os
-os.environ['TF_KERAS_SAVE_FORMAT'] = 'keras'  # Force Keras v3 format
+os.environ['TF_KERAS_SAVE_FORMAT'] = 'keras'  # Force Keras v3 format for model saving
 import tensorflow as tf
-tf.get_logger().setLevel('ERROR')
+tf.get_logger().setLevel('ERROR')  # Suppress TensorFlow info messages
 
-import numpy as np
-import seaborn as sns
-import matplotlib.pyplot as plt
-from collections import defaultdict
+import numpy as np  # Numerical computing
+import seaborn as sns  # Statistical visualization
+import matplotlib.pyplot as plt  # Plotting
+from collections import defaultdict  # Dictionary with default values
 
 # Deep Learning framework
-from tensorflow.keras import layers, models, regularizers
-from tensorflow.keras.layers import MultiHeadAttention, LayerNormalization
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.saving import register_keras_serializable
-from tensorflow.keras.applications import ResNet50
-from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras import layers, models, regularizers  # Core Keras components
+from tensorflow.keras.layers import MultiHeadAttention, LayerNormalization  # Transformer components
+from tensorflow.keras.preprocessing.image import ImageDataGenerator  # Data augmentation
+from tensorflow.keras.saving import register_keras_serializable  # Custom layer serialization
+from tensorflow.keras.applications import ResNet50  # Pre-trained CNN backbone
+from tensorflow.keras.applications.resnet50 import preprocess_input  # ResNet-specific preprocessing
+from sklearn.utils.class_weight import compute_class_weight  # Class imbalance handling
 
 # Machine Learning metrics
 from sklearn.metrics import (
     f1_score, classification_report, cohen_kappa_score, log_loss,
-    precision_score, top_k_accuracy_score, roc_auc_score,confusion_matrix,
+    precision_score, top_k_accuracy_score, roc_auc_score, confusion_matrix,
     balanced_accuracy_score
 )
 from sklearn.utils import class_weight
 from sklearn.metrics import recall_score
-from tensorflow.python.keras.models import save_model
+from tensorflow.python.keras.models import save_model  # Model saving
 
+MODEL_PATH = os.path.abspath('best_model.keras')  # Path for saving best model
 
-MODEL_PATH = os.path.abspath('best_model.keras')
 # ====================== DATA CONFIGURATION ======================
 # Dataset paths
-train_dir = r'C:\Users\User\Documents\OsuSpring2025\DeepLearning\FProject\.venv\train'  # Contains class subfolders
-test_dir = r'C:\Users\User\Documents\OsuSpring2025\DeepLearning\FProject\.venv\test'
+train_dir = r'/home/ubuntu/FinalProject/.venv/train'  # Training data directory
+test_dir = r'/home/ubuntu/FinalProject/.venv/test'  # Test data directory
 
 # Image parameters
-IMG_SIZE = 48 # Original image size from FER2013 dataset
-TARGET_SIZE = 224 # Required input size for ResNet50
-BATCH_SIZE = 32 # Number of samples processed before model update
+IMG_SIZE = 48  # Original image size from dataset
+TARGET_SIZE = 224  # ResNet50 required input size
+BATCH_SIZE = 32  # Number of samples per training batch
 
 # Emotion class labels
 CLASS_NAMES = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
 
+# Custom preprocessing registration for model serialization
 @register_keras_serializable(package="Custom", name="resnet_preprocess")
 def resnet_preprocess(x):
-    """Custom preprocessing function for ResNet50 compatibility"""
+    """ResNet50-specific preprocessing (channel-wise center normalization)"""
     return preprocess_input(x)
 
 
@@ -76,66 +78,53 @@ def print_class_distribution(data_dir):
 
 
 def create_data_generators():
-    """
-    Create data generators with augmentation for training/validation/test sets.
-
-    Returns:
-        tuple: (train_generator, val_generator, test_generator)
-    """
-    # Configure augmentation pipeline for training data
+    """Create data generators with augmentation for training/validation/test sets"""
+    # Training data augmentation configuration
     train_datagen = ImageDataGenerator(
-        preprocessing_function=resnet_preprocess,  # Model-specific preprocessing
         rotation_range=35,  # Random rotation ±35 degrees
-        width_shift_range=0.25,  # Horizontal shift ±25% of width
-        height_shift_range=0.25,  # Vertical shift ±25% of height
-        brightness_range=[0.6, 1.4],  # Random brightness adjustment
+        width_shift_range=0.25,  # Horizontal shift up to 25% width
+        height_shift_range=0.25,  # Vertical shift up to 25% height
+        brightness_range=[0.5, 1.5],  # Random brightness adjustment
         shear_range=0.4,  # Shear transformation intensity
-        zoom_range=0.4,  # Random zoom range [60%, 140%]
+        zoom_range=0.4,  # Random zoom between 60%-140%
         horizontal_flip=True,  # Random horizontal flips
-        channel_shift_range=50,  # Random color channel shifts
         fill_mode='constant',  # Fill new pixels with constant value
-        validation_split=0.2  # Reserve 20% for validation
+        validation_split=0.2  # 20% validation split
     )
 
-    # Configure preprocessing for test/validation data (no augmentation)
-    test_datagen = ImageDataGenerator(
-        preprocessing_function=resnet_preprocess  # Only preprocessing
-    )
+    # Test/validation preprocessing (no augmentation)
+    test_datagen = ImageDataGenerator()
 
-    # Training data generator with augmented samples
+    # Training generator with augmentation
     train_generator = train_datagen.flow_from_directory(
         directory=train_dir,
-        target_size=(IMG_SIZE, IMG_SIZE),  # Resize images
-        color_mode='rgb',  # Maintain 3 color channels
-        batch_size=BATCH_SIZE,  # Samples per batch
+        target_size=(IMG_SIZE, IMG_SIZE),
+        color_mode='grayscale',  # Input as single-channel
+        batch_size=BATCH_SIZE,
         class_mode='categorical',  # One-hot encoded labels
-        classes=CLASS_NAMES,  # Maintain class order
-        subset='training',  # Use training portion of split
-        interpolation='bicubic',  # High-quality resizing
+        subset='training',  # Training portion of split
         seed=42  # Reproducible randomness
     )
 
-    # Validation data generator (uses same directory with subset)
+    # Validation generator
     val_generator = train_datagen.flow_from_directory(
         directory=train_dir,
         target_size=(IMG_SIZE, IMG_SIZE),
-        color_mode='rgb',
+        color_mode='grayscale',
         batch_size=BATCH_SIZE,
         class_mode='categorical',
-        classes=CLASS_NAMES,
         shuffle=False,  # Maintain order for evaluation
-        subset='validation'  # Use validation portion
+        subset='validation'  # Validation portion
     )
 
-    # Test data generator (separate directory)
+    # Test generator
     test_generator = test_datagen.flow_from_directory(
         directory=test_dir,
         target_size=(IMG_SIZE, IMG_SIZE),
-        color_mode='rgb',
+        color_mode='grayscale',
         batch_size=BATCH_SIZE,
         class_mode='categorical',
-        classes=CLASS_NAMES,
-        shuffle=False  # Maintain original test order
+        shuffle=False  # Maintain original order
     )
 
     return train_generator, val_generator, test_generator
@@ -191,23 +180,25 @@ def visualize_augmented_images(generator, num_samples=8, cols=4, figsize=(15, 6)
 
 # ====================== MODEL ARCHITECTURE ======================
 def efficient_transformer_block(x, num_heads=4, projection_dim=None, dropout=0.1):
-    """Lightweight transformer with automatic dimension matching"""
+    """Transformer block with efficient attention and feed-forward network"""
     input_channels = x.shape[-1]
     projection_dim = projection_dim or input_channels
 
-    # Self-attention with dimension preservation
+    # Multi-head self-attention
     attn = MultiHeadAttention(
         num_heads=num_heads,
         key_dim=projection_dim // num_heads,
         dropout=dropout
     )(x, x)
 
-    # Residual connection with dimension matching
+    # Channel adjustment if needed
     if attn.shape[-1] != input_channels:
         attn = layers.Conv2D(input_channels, 1)(attn)
+
+    # Add & Norm
     x = LayerNormalization(epsilon=1e-6)(x + attn)
 
-    # Feed-forward with dimension restoration
+    # Feed-forward network with GELU activation
     ffn = layers.Conv2D(projection_dim * 4, 1, activation='gelu')(x)
     ffn = layers.Conv2D(input_channels, 1)(ffn)
     ffn = layers.Dropout(dropout)(ffn)
@@ -215,25 +206,63 @@ def efficient_transformer_block(x, num_heads=4, projection_dim=None, dropout=0.1
     return LayerNormalization(epsilon=1e-6)(x + ffn)
 
 
+def spatial_channel_attention(input_tensor, reduction_ratio=8):
+    """Dual attention mechanism for both channel and spatial refinement"""
+    # ===== Channel Attention =====
+    channel = input_tensor.shape[-1]
+
+    # Global context learning
+    avg_pool = layers.GlobalAveragePooling2D(keepdims=True)(input_tensor)
+    max_pool = layers.GlobalMaxPooling2D(keepdims=True)(input_tensor)
+
+    # Shared MLP for channel weighting
+    mlp = layers.Dense(channel // reduction_ratio, activation='relu')
+    avg_out = mlp(avg_pool)
+    max_out = mlp(max_pool)
+
+    # Channel attention weights
+    channel_weights = layers.Add()([avg_out, max_out])
+    channel_weights = layers.Dense(channel, activation='sigmoid')(channel_weights)
+
+    # ===== Spatial Attention =====
+    # Concatenate pooled features
+    avg_spatial = layers.Lambda(lambda x: tf.reduce_mean(x, axis=-1, keepdims=True))(input_tensor)
+    max_spatial = layers.Lambda(lambda x: tf.reduce_max(x, axis=-1, keepdims=True))(input_tensor)
+    spatial_concat = layers.Concatenate(axis=-1)([avg_spatial, max_spatial])
+    # Spatial attention weights
+    spatial_weights = layers.Conv2D(1, (7, 7), padding='same', activation='sigmoid')(spatial_concat)
+
+    # ===== Combine Both Attentions =====
+    # Apply channel attention first
+    refined = layers.Multiply()([input_tensor, channel_weights])
+    # Then apply spatial attention
+    refined = layers.Multiply()([refined, spatial_weights])
+
+    # Residual connection
+    return layers.Add()([input_tensor, refined])
+
+
 def build_class_branch(x, emotion):
-    """Specialized branch for challenging emotions"""
-    # Channel attention
-    channel_att = layers.GlobalAvgPool2D()(x)
-    channel_att = layers.Dense(x.shape[-1], activation='sigmoid')(channel_att)
-    x_att = layers.Multiply()([x, channel_att])
+    """Class-specific channel weighting without spatial redundancy"""
+    # Emotion-specific channel attention
+    channel_weights = layers.Dense(
+        x.shape[-1],
+        activation='sigmoid',
+        name=f"{emotion}_channel_weights"
+    )(layers.GlobalAvgPool2D()(x))
 
-    # Spatial attention
-    spatial_att = layers.Conv2D(1, 7, activation='sigmoid')(x_att)
-    x_att = layers.Multiply()([x_att, spatial_att])
+    # Apply channel weights
+    weighted_features = layers.Multiply()([x, channel_weights])
 
-    # Emotion-specific features
-    x_out = layers.GlobalAvgPool2D()(x_att)
+    # Feature aggregation
+    x_out = layers.GlobalAvgPool2D()(weighted_features)
     x_out = layers.Dense(128, activation='gelu')(x_out)
+
     return x_out
 
 
 def build_resnet_model():
-    """Build hybrid CNN-Transformer architecture"""
+    """Build hybrid ResNet50-Transformer architecture with attention mechanisms"""
     # Input layer for grayscale images
     inputs = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 1))
 
@@ -259,48 +288,42 @@ def build_resnet_model():
         name = 'resnet50'
     )
 
-    # Add spatial attention before ResNet
-    #def channel_attention(input_tensor):
-    #    channel_axis = -1
-    #    avg = layers.GlobalAveragePooling2D()(input_tensor)
-    #    max = layers.GlobalMaxPooling2D()(input_tensor)
-    #    avg = layers.Reshape((1, 1, avg.shape[1]))(avg)
-    #    max = layers.Reshape((1, 1, max.shape[1]))(max)
-    #    concat = layers.Concatenate(axis=channel_axis)([avg, max])
-    #    conv = layers.Conv2D(1, (7, 7), padding='same', activation='sigmoid')(concat)
-    #    return layers.Multiply()([input_tensor, conv])
-
     # Strategic layer unfreezing
     for layer in base_model.layers[:100]:
         layer.trainable = False
 
     x = base_model(x)
-    transformer_dim = x.shape[-1]
-    #x = channel_attention(x)
 
+    # ========== DUAL ATTENTION BLOCK ==========
+    x = spatial_channel_attention(x) # Add this line
     # Transformer-enhanced feature refinement
-    x = efficient_transformer_block(
-        x,
-        num_heads=8,
-    )
+    x = efficient_transformer_block(x,num_heads=8)
+
+    def build_class_branch(x, emotion):
+        """Specialized branch for challenging emotions"""
+        # Emotion-specific features
+        x_out = layers.GlobalAvgPool2D()(x)
+        x_out = layers.Dense(128, activation='gelu')(x_out)
+        return x_out
 
     # Class-specific attention branches
+    main_branch = layers.GlobalAvgPool2D()(x)
     angry_branch = build_class_branch(x, 'angry')
     fear_branch = build_class_branch(x, 'fear')
     disgust_branch = build_class_branch(x, 'disgust')
     sad_branch = build_class_branch(x, 'sad')
-    main_branch = layers.GlobalAvgPool2D()(x)
 
     # Fusion layer
     combined = layers.Concatenate()([main_branch, angry_branch, disgust_branch, fear_branch, sad_branch])
     combined = layers.Dense(512, activation='gelu')(combined)
-
+    combined = layers.Dropout(0.5)(combined)
     # Output
     outputs = layers.Dense(7, activation='softmax')(combined)
 
     print(f"Total layers in ResNet50: {len(base_model.layers)}")
 
     model = models.Model(inputs, outputs)
+
     # Enable mixed precision training
     tf.keras.mixed_precision.set_global_policy('mixed_float16')
 
@@ -309,105 +332,22 @@ def build_resnet_model():
     return model
 
 
-# ====================== DATA PIPELINE ENHANCEMENTS ======================
-class BalancedDataGenerator(tf.keras.utils.Sequence):
-    """Class-aware augmentation pipeline with proper batch handling"""
-
-    def __init__(self, base_generator, augment_dict):
-        self.base_gen = base_generator
-        self.augment_dict = augment_dict
-        self.classes = base_generator.classes
-
-    def __len__(self):
-        return len(self.base_gen)
-
-    def __getitem__(self, idx):
-        x_batch, y_batch = self.base_gen[idx]
-
-        # Process each sample individually
-        augmented_batch = []
-        for i in range(x_batch.shape[0]):
-            x = x_batch[i]
-            y = y_batch[i]
-
-            # Get class index for this sample
-            class_idx = np.argmax(y)
-
-            if class_idx in self.augment_dict:
-                # Add batch dimension for augmentation
-                x_aug = np.expand_dims(x, axis=0)
-                augmented = self.augment_dict[class_idx].random_transform(x_aug[0])
-                augmented_batch.append(augmented)
-            else:
-                augmented_batch.append(x)
-
-        return np.stack(augmented_batch, axis=0), y_batch
-
-
-def create_class_aware_generators():
-    """Configure data generators with enhanced augmentation"""
-    # Base generators
-    train_gen, val_gen, test_gen = create_data_generators()
-
-    # Class-specific augmentation
-    augment_strategies = {
-        1: ImageDataGenerator(  # Disgust
-            rotation_range=45,
-            width_shift_range=0.3,
-            zoom_range=0.5,
-            fill_mode='constant'
-        ),
-        2: ImageDataGenerator(  # Fear
-            width_shift_range=0.25,
-            height_shift_range=0.25,
-            brightness_range=[0.4, 1.6]
-        )
-    }
-
-    return (
-        BalancedDataGenerator(train_gen, augment_strategies),
-        val_gen,
-        test_gen
-    )
-
-# ====================== TRAINING STRATEGY ======================
-# ====================== CUSTOM LOSS FUNCTION ======================
-class AdaptiveFocalLoss(tf.keras.losses.Loss):
-    """Class-weighted focal loss with dynamic gamma"""
-    def __init__(self, class_weights_list, gamma=2.0, name="adaptive_focal_loss"):
-        super().__init__(name=name)
-        self.class_weights = tf.constant(class_weights_list, dtype=tf.float32)
-        self.gamma = gamma
-
-    def call(self, y_true, y_pred):
-        ce = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
-        pt = tf.math.exp(-ce)
-        focal_loss = tf.math.pow(1 - pt, self.gamma) * ce
-        weights = tf.reduce_sum(self.class_weights * y_true, axis=-1)
-        return tf.reduce_mean(focal_loss * weights)
-
 # ====================== TRAINING PIPELINE ======================
 def train_model(model, train_gen, val_gen,
                 initial_epochs=20,
                 fine_tune_epochs=30,
                 final_tune_epochs=10):
-    """Two-phase training process with transfer learning"""
-    # Calculate class weights as dictionary for Keras and list for loss
-    class_counts = np.bincount(train_gen.classes)
-    total_samples = sum(class_counts)
-    num_classes = len(class_counts)
-
-    # Create both representations
-    class_weights_dict = {
-        i: (1.0 / (count / total_samples)) * 0.5
-        for i, count in enumerate(class_counts)
-    }
-    class_weights_dict[1] *= 3.0  # Boost disgust class
-
-    class_weights_list = [class_weights_dict[i] for i in range(num_classes)]
+    """Three-phase training process with progressive unfreezing"""
+    # Class weighting for imbalanced data
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(train_gen.classes),
+        y=train_gen.classes
+    )
+    class_weights_dict = {i: w for i, w in enumerate(class_weights)}
 
     # Common callbacks
-    callbacks = [
+    base_callbacks = [
         tf.keras.callbacks.EarlyStopping(
             patience=15,
             monitor='val_loss',
@@ -419,6 +359,9 @@ def train_model(model, train_gen, val_gen,
             save_best_only=True,
             mode='max'
         ),
+    ]
+
+    full_callbacks = base_callbacks + [
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss',
             factor=0.5,
@@ -427,19 +370,20 @@ def train_model(model, train_gen, val_gen,
         )
     ]
 
-    # Phase 1: Initial training with frozen base
+    # Training phase 1: Frozen base model
     base_model = model.get_layer("resnet50")
     base_model.trainable = False
 
     # Custom learning rate schedule
     lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=3e-4,
-        decay_steps=initial_epochs * len(train_gen)
+        initial_learning_rate=1e-5,
+        decay_steps=initial_epochs * len(train_gen),
+        alpha=3e-4
     )
 
     model.compile(
         optimizer=tf.keras.optimizers.AdamW(lr_schedule, weight_decay=1e-3),
-        loss=AdaptiveFocalLoss(class_weights_list),
+        loss='categorical_crossentropy',
         metrics=['accuracy', tf.keras.metrics.Recall(class_id=1)]
     )
 
@@ -450,7 +394,7 @@ def train_model(model, train_gen, val_gen,
         epochs=initial_epochs,
         validation_data=val_gen,
         class_weight=class_weights_dict,
-        callbacks=callbacks,
+        callbacks=base_callbacks,
         verbose=1
     )
 
@@ -458,10 +402,10 @@ def train_model(model, train_gen, val_gen,
     all_histories = [initial_history]
     current_epoch = initial_epochs
 
-    # Phase 2: Progressive fine-tuning
+    # Training phase 2: Progressive unfreezing
     print("\n=== Phase 2: Fine-Tuning ===")
     unfreeze_schedule = [
-        (160, 175, 10, 1e-5),  # Last 15 layers
+        (160, 175, 10, 1e-5),  # Last layers
         (140, 160, 15, 5e-6),  # Middle layers
         (100, 140, 20, 1e-6)  # Earlier layers
     ]
@@ -476,7 +420,7 @@ def train_model(model, train_gen, val_gen,
 
         model.compile(
             optimizer=tf.keras.optimizers.Adam(lr),
-            loss=AdaptiveFocalLoss(class_weights_list),
+            loss='categorical_crossentropy',
             metrics=['accuracy']
         )
 
@@ -486,13 +430,13 @@ def train_model(model, train_gen, val_gen,
             epochs=current_epoch + epochs,
             validation_data=val_gen,
             class_weight=class_weights_dict,
-            callbacks=callbacks,
+            callbacks=full_callbacks,
             verbose=1
         )
         all_histories.append(phase_history)
         current_epoch += epochs
 
-    # Phase 3: Final head tuning
+    # Training phase 3: Head tuning
     print("\n=== Phase 3: Final Tuning ===")
     base_model.trainable = False
     for layer in model.layers:
@@ -501,7 +445,7 @@ def train_model(model, train_gen, val_gen,
 
     model.compile(
         optimizer=tf.keras.optimizers.Adam(1e-7),
-        loss=AdaptiveFocalLoss(class_weights_list),
+        loss='categorical_crossentropy',
         metrics=['accuracy']
     )
 
@@ -511,7 +455,7 @@ def train_model(model, train_gen, val_gen,
         epochs=current_epoch + final_tune_epochs,
         validation_data=val_gen,
         class_weight=class_weights_dict,
-        callbacks=callbacks,
+        callbacks=full_callbacks,
         verbose=1
     )
     all_histories.append(final_history)
@@ -527,16 +471,7 @@ def train_model(model, train_gen, val_gen,
 
 # ====================== VISUALIZATION & EVALUATION ======================
 def visualize_conv_kernels(model, layer_name, layer_index, max_filters=32, output_dir='conv_kernels'):
-    """
-    Visualize and save convolutional filters/weights for model interpretation.
-
-    Args:
-        model (keras.Model): Trained Keras model
-        layer_name (str): Name of the Conv2D layer to visualize
-        layer_index (int): Index of convolutional layer (when max_filters=-1)
-        max_filters (int): Maximum filters to display (-1 for legacy mode)
-        output_dir (str): Output directory for saved images
-    """
+    """Visualize convolutional filters for model interpretation"""
     # Legacy mode: Visualize using layer index
     if max_filters == -1:
         # Get all Conv2D layers using isinstance for accurate type checking
@@ -625,18 +560,7 @@ def visualize_conv_kernels(model, layer_name, layer_index, max_filters=32, outpu
 
 def plot_feature_maps(model, input_image, layer_index=0, rows=4, cols=8,
                       output_dir='feature_maps', filename=None):
-    """
-    Visualize and save feature maps from specified convolutional layer.
-
-    Args:
-        model (keras.Model): Trained Keras model
-        input_image (np.array): Preprocessed input image (H, W, C)
-        layer_index (int): Index of conv layer to visualize
-        rows (int): Grid rows for display
-        cols (int): Grid columns for display
-        output_dir (str): Output directory path
-        filename (str): Optional custom filename
-    """
+    """Visualize activation maps from convolutional layers"""
     # Get all Conv2D layers in model
     conv_layers = [layer for layer in model.layers
                    if isinstance(layer, layers.Conv2D)]
@@ -691,15 +615,6 @@ def plot_resnet_feature_maps(model, input_image, rows=4, cols=8,
                              target_size=224):
     """
     Visualize and save ResNet50 feature maps with proper preprocessing.
-
-    Args:
-        model (keras.Model): Model containing ResNet50 base
-        input_image (np.array): Input image array
-        rows (int): Grid rows per layer
-        cols (int): Grid columns per layer
-        output_dir (str): Output directory path
-        filename_prefix (str): Filename prefix for saved images
-        target_size (int): Input size for ResNet preprocessing
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -793,17 +708,7 @@ def plot_combined_history(history, output_dir='training_history'):
 
 
 def evaluate_model(model, test_gen, class_names, output_dir='results'):
-    """
-    Comprehensive model evaluation with visualizations.
-
-    Args:
-        model: Trained Keras model
-        test_gen: Test data generator
-        class_names: List of class labels
-        output_dir: Output directory path
-    Returns:
-        float: Maximum class accuracy
-    """
+    """Comprehensive model evaluation with metrics and visualizations"""
     # Generate predictions
     test_gen.reset()
     y_true = []
@@ -877,7 +782,7 @@ def evaluate_model(model, test_gen, class_names, output_dir='results'):
 
 # ====================== MAIN EXECUTION PIPELINE ======================
 def main():
-    """End-to-end execution pipeline for model training and evaluation."""
+    """End-to-end execution pipeline"""
 
     # ====================== DATA PREPARATION ======================
     # Initialize data generators for all splits
@@ -904,7 +809,6 @@ def main():
     # ====================== MODEL SETUP ======================
     # Construct model architecture
     model = build_resnet_model()  # Custom ResNet-based architecture
-    train_gen, val_gen, test_gen = create_class_aware_generators()
 
     # ====================== TRAINING PHASES ======================
     # Execute multi-phase training process
@@ -912,23 +816,33 @@ def main():
         model=model,
         train_gen=train_gen,
         val_gen=val_gen,
-        initial_epochs=1,  # Feature extraction phase
-        fine_tune_epochs=1,  # Fine-tuning phase
-        final_tune_epochs=1  # Final optimization
+        initial_epochs=30,  # Feature extraction phase
+        fine_tune_epochs=50,  # Fine-tuning phase
+        final_tune_epochs=20  # Final optimization
     )
 
     # ====================== MODEL MANAGEMENT ======================
-    # Model loading with existence check
+    # Model loading with custom objects
+    custom_objects = {
+        "resnet_preprocess": resnet_preprocess
+    }
+
     if os.path.exists(MODEL_PATH):
         print(f"\nLoading best model from {MODEL_PATH}")
-        best_model = tf.keras.models.load_model(
-            MODEL_PATH,
-            custom_objects={'resnet_preprocess': resnet_preprocess}  # Handle custom layer
-        )
+        try:
+            best_model = tf.keras.models.load_model(
+                MODEL_PATH,
+                custom_objects=custom_objects,
+                safe_mode=False  # Disable safe mode check
+            )
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            print("Falling back to newly trained model")
+            best_model = trained_model
     else:
         print("\nNo saved model found. Using final trained model.")
-        best_model = trained_model  # Fallback to latest version
-        best_model.save(MODEL_PATH, save_format='keras')  # Persist model
+        best_model = trained_model
+        best_model.save(MODEL_PATH, save_format='keras')
 
     # ====================== MODEL INSPECTION ======================
     # Verify base model layer structure
